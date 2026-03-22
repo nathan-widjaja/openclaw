@@ -3,7 +3,10 @@ import type { RuntimeEnv } from "../runtime.js";
 export type CliRuntimeCapture = {
   runtimeLogs: string[];
   runtimeErrors: string[];
-  defaultRuntime: Pick<RuntimeEnv, "log" | "error" | "exit">;
+  defaultRuntime: Pick<RuntimeEnv, "log" | "error" | "exit"> & {
+    writeStdout: (value: string) => void;
+    writeJson: (value: unknown, space?: number) => void;
+  };
   resetRuntimeCapture: () => void;
 };
 
@@ -20,6 +23,12 @@ export function createCliRuntimeCapture(): CliRuntimeCapture {
       },
       error: (...args: unknown[]) => {
         runtimeErrors.push(stringifyArgs(args));
+      },
+      writeStdout: (value: string) => {
+        runtimeLogs.push(value.endsWith("\n") ? value.slice(0, -1) : value);
+      },
+      writeJson: (value: unknown, space = 2) => {
+        runtimeLogs.push(JSON.stringify(value, null, space > 0 ? space : undefined));
       },
       exit: (code: number) => {
         throw new Error(`__exit__:${code}`);
