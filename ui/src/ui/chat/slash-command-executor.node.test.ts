@@ -277,6 +277,9 @@ describe("executeSlashCommand directives", () => {
           },
         };
       }
+      if (method === "models.list") {
+        return { models: [{ id: "gpt-5-mini", name: "gpt-5-mini", provider: "openai" }] };
+      }
       throw new Error(`unexpected method: ${method}`);
     });
 
