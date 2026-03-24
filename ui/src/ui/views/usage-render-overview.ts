@@ -144,7 +144,7 @@ function renderFilterChips(
       ${
         (selectedDays.length > 0 || selectedHours.length > 0) && selectedSessions.length > 0
           ? html`
-            <button class="btn btn--sm filter-clear-btn" @click=${onClearFilters}>
+            <button class="btn btn--sm" @click=${onClearFilters}>
               ${t("usage.filters.clearAll")}
             </button>
           `
