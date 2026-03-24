@@ -1,7 +1,7 @@
-export { auditDiscordChannelPermissions } from "../../extensions/discord/runtime-api.js";
+export { auditDiscordChannelPermissions } from "../../extensions/discord/src/audit.js";
 export {
   listDiscordDirectoryGroupsLive,
   listDiscordDirectoryPeersLive,
-} from "../../extensions/discord/runtime-api.js";
-export { resolveDiscordChannelAllowlist } from "../../extensions/discord/runtime-api.js";
-export { resolveDiscordUserAllowlist } from "../../extensions/discord/runtime-api.js";
+} from "../../extensions/discord/src/directory-live.js";
+export { resolveDiscordChannelAllowlist } from "../../extensions/discord/src/resolve-channels.js";
+export { resolveDiscordUserAllowlist } from "../../extensions/discord/src/resolve-users.js";

@@ -1,2 +1,2 @@
-export { monitorDiscordProvider } from "../../extensions/discord/runtime-api.js";
-export { probeDiscord } from "../../extensions/discord/runtime-api.js";
+export { monitorDiscordProvider } from "../../extensions/discord/src/monitor/provider.runtime.js";
+export { probeDiscord } from "../../extensions/discord/src/probe.js";
