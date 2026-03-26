@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "./test-mocks.js";
+
+const waitForBlueBubblesOutboundConfirmationMock = vi.hoisted(() => vi.fn());
+
+vi.mock("./outbound-confirmation.js", () => ({
+  waitForBlueBubblesOutboundConfirmation: waitForBlueBubblesOutboundConfirmationMock,
+}));
+
 import { getCachedBlueBubblesPrivateApiStatus } from "./probe.js";
 import type { PluginRuntime } from "./runtime-api.js";
 import { clearBlueBubblesRuntime, setBlueBubblesRuntime } from "./runtime.js";
@@ -17,6 +24,13 @@ const privateApiStatusMock = vi.mocked(getCachedBlueBubblesPrivateApiStatus);
 installBlueBubblesFetchTestHooks({
   mockFetch,
   privateApiStatusMock,
+});
+
+beforeEach(() => {
+  waitForBlueBubblesOutboundConfirmationMock.mockReset();
+  waitForBlueBubblesOutboundConfirmationMock.mockResolvedValue({
+    source: "webhook",
+  });
 });
 
 function mockResolvedHandleTarget(
@@ -779,6 +793,75 @@ describe("send", () => {
       expect(body.tempGuid).toBeDefined();
       expect(typeof body.tempGuid).toBe("string");
       expect(body.tempGuid.length).toBeGreaterThan(0);
+    });
+
+    it("throws when BlueBubbles returns an error envelope with HTTP 200", async () => {
+      mockResolvedHandleTarget();
+      mockSendResponse({
+        status: 500,
+        message: "Message Send Error",
+        error: { message: "Transaction timeout", type: "iMessage Error" },
+      });
+
+      await expect(
+        sendMessageBlueBubbles("+15551234567", "Hello", {
+          serverUrl: "http://localhost:1234",
+          password: "test",
+        }),
+      ).rejects.toThrow("Transaction timeout");
+    });
+
+    it("retries once when BlueBubbles accepts the send but no confirmation arrives", async () => {
+      waitForBlueBubblesOutboundConfirmationMock
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ source: "webhook" });
+
+      mockResolvedHandleTarget();
+      mockSendResponse({ data: { guid: "msg-first-attempt" } });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: [] }),
+      });
+      mockSendResponse({ data: { guid: "msg-second-attempt" } });
+
+      const result = await sendMessageBlueBubbles("+15551234567", "Hello", {
+        serverUrl: "http://localhost:1234",
+        password: "test",
+        deliveryRetryBaseDelayMs: 1,
+      });
+
+      expect(result.messageId).toBe("msg-second-attempt");
+      expect(waitForBlueBubblesOutboundConfirmationMock).toHaveBeenCalledTimes(2);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it("uses recent history as delivery confirmation before retrying", async () => {
+      waitForBlueBubblesOutboundConfirmationMock.mockResolvedValueOnce(null);
+
+      mockResolvedHandleTarget();
+      mockSendResponse({ data: { guid: "msg-api-response" } });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                guid: "msg-history-confirmed",
+                text: "Hello from history",
+                is_from_me: true,
+              },
+            ],
+          }),
+      });
+
+      const result = await sendMessageBlueBubbles("+15551234567", "Hello from history", {
+        serverUrl: "http://localhost:1234",
+        password: "test",
+      });
+
+      expect(result.messageId).toBe("msg-history-confirmed");
+      expect(waitForBlueBubblesOutboundConfirmationMock).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
     });
   });
 

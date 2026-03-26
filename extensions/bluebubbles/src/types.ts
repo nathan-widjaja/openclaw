@@ -53,6 +53,12 @@ export type BlueBubblesAccountConfig = {
   mediaLocalRoots?: string[];
   /** Send read receipts for incoming messages (default: true). */
   sendReadReceipts?: boolean;
+  /** Wait this long for webhook or history confirmation before treating an outbound send as unconfirmed. */
+  sendConfirmationTimeoutMs?: number;
+  /** Retry count when BlueBubbles accepts a send but no confirmation arrives. */
+  sendRetryCount?: number;
+  /** Base delay between send retries; exponential backoff is applied from this value. */
+  sendRetryBaseDelayMs?: number;
   /** Allow fetching from private/internal IP addresses (e.g. localhost). Required for same-host BlueBubbles setups. */
   allowPrivateNetwork?: boolean;
   /** Per-group configuration keyed by chat GUID or identifier. */

@@ -33,6 +33,7 @@ import type {
   BlueBubblesRuntimeEnv,
   WebhookTarget,
 } from "./monitor-shared.js";
+import { confirmBlueBubblesOutboundMessage } from "./outbound-confirmation.js";
 import { isBlueBubblesPrivateApiEnabled } from "./probe.js";
 import { normalizeBlueBubblesReactionInput, sendBlueBubblesReaction } from "./reactions.js";
 import type { OpenClawConfig } from "./runtime-api.js";
@@ -521,6 +522,14 @@ export async function processMessage(
   if (message.fromMe) {
     // Cache from-me messages so reply context can resolve sender/body.
     cacheInboundMessage();
+    confirmBlueBubblesOutboundMessage({
+      accountId: account.accountId,
+      chatGuid: message.chatGuid,
+      chatIdentifier: message.chatIdentifier,
+      chatId: message.chatId,
+      messageId: cacheMessageId,
+      body: rawBody,
+    });
     const confirmedAssistantOutbound =
       confirmedOutboundCacheEntry?.senderLabel === "me" &&
       normalizeSnippet(confirmedOutboundCacheEntry.body ?? "") === normalizeSnippet(rawBody);
