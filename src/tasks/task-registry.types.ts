@@ -57,6 +57,7 @@ export type TaskRecord = {
   requesterSessionKey: string;
   ownerKey: string;
   scopeKind: TaskScopeKind;
+  requesterSessionKey?: string;
   childSessionKey?: string;
   parentTaskId?: string;
   agentId?: string;

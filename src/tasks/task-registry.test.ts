@@ -1084,6 +1084,8 @@ describe("task-registry", () => {
                 {
                   taskId: "task-missing-cleanup",
                   runtime: "cron",
+                  ownerKey: "system:cron:maintenance",
+                  scopeKind: "system",
                   requesterSessionKey: "",
                   ownerKey: "system:cron:task-missing-cleanup",
                   scopeKind: "system",
@@ -1133,6 +1135,8 @@ describe("task-registry", () => {
                 {
                   taskId: "task-audit-summary",
                   runtime: "acp",
+                  ownerKey: "agent:main:main",
+                  scopeKind: "session",
                   requesterSessionKey: "agent:main:main",
                   ownerKey: "agent:main:main",
                   scopeKind: "session",

@@ -98,6 +98,7 @@ function rowToTaskRecord(row: TaskRegistryRow): TaskRecord {
     requesterSessionKey: row.scope_kind === "system" ? "" : row.owner_key,
     ownerKey: row.owner_key,
     scopeKind: row.scope_kind,
+    requesterSessionKey: row.owner_key,
     ...(row.child_session_key ? { childSessionKey: row.child_session_key } : {}),
     ...(row.parent_task_id ? { parentTaskId: row.parent_task_id } : {}),
     ...(row.agent_id ? { agentId: row.agent_id } : {}),
