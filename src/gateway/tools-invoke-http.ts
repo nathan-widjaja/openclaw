@@ -30,16 +30,17 @@ import { normalizeMessageChannel } from "../utils/message-channel.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
 import {
-  authorizeGatewayBearerRequestOrReply,
-  resolveGatewayRequestedOperatorScopes,
-} from "./http-auth-helpers.js";
-import {
   readJsonBodyOrError,
   sendInvalidRequest,
   sendJson,
   sendMethodNotAllowed,
 } from "./http-common.js";
-import { getHeader } from "./http-utils.js";
+import {
+  authorizeGatewayHttpRequestOrReply,
+  getHeader,
+  resolveOpenAiCompatibleHttpOperatorScopes,
+  resolveOpenAiCompatibleHttpSenderIsOwner,
+} from "./http-utils.js";
 import { authorizeOperatorScopesForMethod } from "./method-scopes.js";
 
 const DEFAULT_BODY_BYTES = 2 * 1024 * 1024;
@@ -161,7 +162,7 @@ export async function handleToolsInvokeHttpRequest(
   }
 
   const cfg = loadConfig();
-  const ok = await authorizeGatewayBearerRequestOrReply({
+  const requestAuth = await authorizeGatewayHttpRequestOrReply({
     req,
     res,
     auth: opts.auth,
@@ -169,11 +170,14 @@ export async function handleToolsInvokeHttpRequest(
     allowRealIpFallback: opts.allowRealIpFallback ?? cfg.gateway?.allowRealIpFallback,
     rateLimiter: opts.rateLimiter,
   });
-  if (!ok) {
+  if (!requestAuth) {
     return true;
   }
 
-  const requestedScopes = resolveGatewayRequestedOperatorScopes(req);
+  // /tools/invoke intentionally uses the same shared-secret HTTP trust model as
+  // the OpenAI-compatible APIs: token/password bearer auth is full operator
+  // access for the gateway, not a narrower per-request scope boundary.
+  const requestedScopes = resolveOpenAiCompatibleHttpOperatorScopes(req, requestAuth);
   const scopeAuth = authorizeOperatorScopesForMethod("agent", requestedScopes);
   if (!scopeAuth.allowed) {
     sendJson(res, 403, {
@@ -323,9 +327,10 @@ export async function handleToolsInvokeHttpRequest(
     Array.isArray(gatewayToolsCfg?.deny) ? gatewayToolsCfg.deny : [],
   );
   const gatewayDenySet = new Set(gatewayDenyNames);
-  // HTTP bearer auth does not bind a device-owner identity, so owner-only tools
-  // stay unavailable on this surface even when callers assert admin scopes.
-  const ownerFiltered = applyOwnerOnlyToolPolicy(subagentFiltered, false);
+  // Owner semantics intentionally follow the same shared-secret HTTP contract
+  // on this direct tool surface; SECURITY.md documents this as designed-as-is.
+  const senderIsOwner = resolveOpenAiCompatibleHttpSenderIsOwner(req, requestAuth);
+  const ownerFiltered = applyOwnerOnlyToolPolicy(subagentFiltered, senderIsOwner);
   const gatewayFiltered = ownerFiltered.filter((t) => !gatewayDenySet.has(t.name));
 
   const tool = gatewayFiltered.find((t) => t.name === toolName);

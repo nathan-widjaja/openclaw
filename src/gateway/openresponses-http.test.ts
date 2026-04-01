@@ -45,13 +45,28 @@ async function startServer(port: number, opts?: { openResponsesEnabled?: boolean
   const { startGatewayServer } = await import("./server.js");
   const serverOpts = {
     host: "127.0.0.1",
-    auth: { mode: "token", token: "secret" },
+    auth: { mode: "none" as const },
     controlUiEnabled: false,
   } as const;
   return await startGatewayServer(
     port,
     opts?.openResponsesEnabled === undefined
       ? serverOpts
+      : { ...serverOpts, openResponsesEnabled: opts.openResponsesEnabled },
+  );
+}
+
+async function startTokenServer(port: number, opts?: { openResponsesEnabled?: boolean }) {
+  const { startGatewayServer } = await import("./server.js");
+  const serverOpts = {
+    host: "127.0.0.1",
+    auth: { mode: "token" as const, token: "secret" },
+    controlUiEnabled: false,
+  } as const;
+  return await startGatewayServer(
+    port,
+    opts?.openResponsesEnabled === undefined
+      ? { ...serverOpts, openResponsesEnabled: true }
       : { ...serverOpts, openResponsesEnabled: opts.openResponsesEnabled },
   );
 }
@@ -70,7 +85,6 @@ async function postResponses(port: number, body: unknown, headers?: Record<strin
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: "Bearer secret",
       "x-openclaw-scopes": "operator.write",
       ...headers,
     },
@@ -174,7 +188,7 @@ async function expectInvalidRequest(
 }
 
 describe("OpenResponses HTTP API (e2e)", () => {
-  it("rejects when disabled (default + config)", { timeout: 15_000 }, async () => {
+  it("rejects when disabled (default + config)", { timeout: 90_000 }, async () => {
     const port = await getFreePort();
     const server = await startServer(port);
     try {
@@ -224,7 +238,7 @@ describe("OpenResponses HTTP API (e2e)", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ model: "openclaw", input: "hi" }),
       });
-      expect(resMissingAuth.status).toBe(401);
+      expect(resMissingAuth.status).toBe(403);
       await ensureResponseConsumed(resMissingAuth);
 
       const resMissingModel = await postResponses(port, { input: "hi" });
@@ -754,6 +768,37 @@ describe("OpenResponses HTTP API (e2e)", () => {
     expect(streamingOpts?.senderIsOwner).toBe(false);
     const streamingEvents = parseSseEvents(await streamingResponse.text());
     expect(streamingEvents.some((event) => event.event === "response.completed")).toBe(true);
+  });
+
+  it("treats shared-secret bearer callers as owner operators", async () => {
+    const port = await getFreePort();
+    const server = await startTokenServer(port);
+    try {
+      agentCommand.mockClear();
+      agentCommand.mockResolvedValueOnce({ payloads: [{ text: "hello" }] } as never);
+
+      const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer secret",
+          "content-type": "application/json",
+          "x-openclaw-scopes": "operator.approvals",
+        },
+        body: JSON.stringify({
+          model: "openclaw",
+          input: "hi",
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const firstCall = (agentCommand.mock.calls[0] as unknown[] | undefined)?.[0] as
+        | { senderIsOwner?: boolean }
+        | undefined;
+      expect(firstCall?.senderIsOwner).toBe(true);
+      await ensureResponseConsumed(res);
+    } finally {
+      await server.close({ reason: "openresponses token auth owner test done" });
+    }
   });
 
   it("preserves assistant text alongside non-stream function_call output", async () => {

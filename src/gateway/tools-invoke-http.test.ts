@@ -7,8 +7,6 @@ type RunBeforeToolCallHook = typeof runBeforeToolCallHookType;
 type RunBeforeToolCallHookArgs = Parameters<RunBeforeToolCallHook>[0];
 type RunBeforeToolCallHookResult = Awaited<ReturnType<RunBeforeToolCallHook>>;
 
-const TEST_GATEWAY_TOKEN = "test-gateway-token-1234567890";
-
 const hookMocks = vi.hoisted(() => ({
   resolveToolLoopDetectionConfig: vi.fn(() => ({ warnAt: 3 })),
   runBeforeToolCallHook: vi.fn(
@@ -50,7 +48,7 @@ vi.mock("../config/sessions.js", () => ({
 }));
 
 vi.mock("./auth.js", () => ({
-  authorizeHttpGatewayConnect: async () => ({ ok: true }),
+  authorizeHttpGatewayConnect: vi.fn(async () => ({ ok: true })),
 }));
 
 vi.mock("../logger.js", () => ({
@@ -197,6 +195,7 @@ vi.mock("../agents/pi-tools.before-tool-call.js", () => ({
   runBeforeToolCallHook: hookMocks.runBeforeToolCallHook,
 }));
 
+const { authorizeHttpGatewayConnect } = await import("./auth.js");
 const { handleToolsInvokeHttpRequest } = await import("./tools-invoke-http.js");
 
 let pluginHttpHandlers: Array<(req: IncomingMessage, res: ServerResponse) => Promise<boolean>> = [];
@@ -208,7 +207,7 @@ beforeAll(async () => {
   sharedServer = createServer((req, res) => {
     void (async () => {
       const handled = await handleToolsInvokeHttpRequest(req, res, {
-        auth: { mode: "token", token: TEST_GATEWAY_TOKEN, allowTailscale: false },
+        auth: { mode: "none", allowTailscale: false },
       });
       if (handled) {
         return;
@@ -260,17 +259,11 @@ beforeEach(() => {
       params: args.params,
     }),
   );
+  vi.mocked(authorizeHttpGatewayConnect).mockResolvedValue({ ok: true });
 });
 
-const resolveGatewayToken = (): string => TEST_GATEWAY_TOKEN;
-const gatewayAuthHeaders = () => ({
-  authorization: `Bearer ${resolveGatewayToken()}`,
-  "x-openclaw-scopes": "operator.write",
-});
-const gatewayAdminHeaders = () => ({
-  authorization: `Bearer ${resolveGatewayToken()}`,
-  "x-openclaw-scopes": "operator.admin",
-});
+const gatewayAuthHeaders = () => ({ "x-openclaw-scopes": "operator.write" });
+const gatewayAdminHeaders = () => ({ "x-openclaw-scopes": "operator.admin" });
 
 const allowAgentsListForMain = () => {
   cfg = {
@@ -438,6 +431,31 @@ describe("POST /tools/invoke", () => {
         message: "blocked by test hook",
       },
     });
+  });
+
+  it("accepts shared-secret bearer auth on the HTTP tools surface", async () => {
+    allowAgentsListForMain();
+    vi.mocked(authorizeHttpGatewayConnect).mockResolvedValueOnce({
+      ok: true,
+      method: "token",
+    });
+
+    const res = await postToolsInvoke({
+      port: sharedPort,
+      headers: {
+        authorization: "Bearer secret",
+        "content-type": "application/json",
+      },
+      body: {
+        tool: "agents_list",
+        action: "json",
+        args: {},
+        sessionKey: "main",
+      },
+    });
+
+    const body = await expectOkInvokeResponse(res);
+    expect(body.result).toEqual({ ok: true, result: [] });
   });
 
   it("uses before_tool_call adjusted params for HTTP tool execution", async () => {
@@ -609,7 +627,10 @@ describe("POST /tools/invoke", () => {
       sessionKey: "main",
     });
 
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error?.type).toBe("tool_error");
   });
 
   it("treats gateway.tools.deny as higher priority than gateway.tools.allow", async () => {
@@ -718,9 +739,7 @@ describe("POST /tools/invoke", () => {
 
     const res = await invokeTool({
       port: sharedPort,
-      headers: {
-        authorization: `Bearer ${resolveGatewayToken()}`,
-      },
+      headers: {},
       tool: "agents_list",
       sessionKey: "main",
     });
@@ -733,6 +752,31 @@ describe("POST /tools/invoke", () => {
         message: "missing scope: operator.write",
       },
     });
+  });
+
+  it("treats shared-secret bearer auth as full operator access on /tools/invoke", async () => {
+    allowAgentsListForMain();
+    vi.mocked(authorizeHttpGatewayConnect).mockResolvedValueOnce({
+      ok: true,
+      method: "token",
+    });
+
+    const res = await postToolsInvoke({
+      port: sharedPort,
+      headers: {
+        authorization: "Bearer secret",
+        "content-type": "application/json",
+      },
+      body: {
+        tool: "agents_list",
+        action: "json",
+        args: {},
+        sessionKey: "main",
+      },
+    });
+
+    const body = await expectOkInvokeResponse(res);
+    expect(body.result).toEqual({ ok: true, result: [] });
   });
 
   it("applies owner-only tool policy on the HTTP path", async () => {
@@ -750,7 +794,29 @@ describe("POST /tools/invoke", () => {
       tool: "owner_only_test",
       sessionKey: "main",
     });
-    expect(allowedRes.status).toBe(404);
+    const allowedBody = await expectOkInvokeResponse(allowedRes);
+    expect(allowedBody.result).toEqual({ ok: true, result: "owner-only" });
+  });
+
+  it("treats shared-secret bearer auth as owner on /tools/invoke", async () => {
+    setMainAllowedTools({ allow: ["owner_only_test"] });
+    vi.mocked(authorizeHttpGatewayConnect).mockResolvedValueOnce({
+      ok: true,
+      method: "token",
+    });
+
+    const res = await invokeTool({
+      port: sharedPort,
+      headers: {
+        authorization: "Bearer secret",
+        "x-openclaw-scopes": "operator.approvals",
+      },
+      tool: "owner_only_test",
+      sessionKey: "main",
+    });
+
+    const body = await expectOkInvokeResponse(res);
+    expect(body.result).toEqual({ ok: true, result: "owner-only" });
   });
 
   it("extends the HTTP deny list to high-risk execution and file tools", async () => {
