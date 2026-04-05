@@ -1,12 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as channelPlugins from "../../channels/plugins/index.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { resetPluginRuntimeStateForTest } from "../../plugins/runtime.js";
 import {
+  createReplyToModeFilter,
   resolveConfiguredReplyToMode,
   resolveReplyToMode,
   resolveReplyToModeWithThreading,
 } from "./reply-threading.js";
 
 const emptyCfg = {} as OpenClawConfig;
+
+describe("reply-threading test setup", () => {
+  it("resets plugin runtime state before fallback resolution coverage", () => {
+    resetPluginRuntimeStateForTest();
+    vi.spyOn(channelPlugins, "getChannelPlugin").mockReturnValue(undefined);
+  });
+});
 
 describe("resolveReplyToMode", () => {
   it("falls back to configured channel defaults when channel threading plugins are unavailable", () => {
@@ -109,5 +119,29 @@ describe("resolveConfiguredReplyToMode", () => {
     expect(resolveConfiguredReplyToMode(cfg, "slack", "group")).toBe("first");
     expect(resolveConfiguredReplyToMode(cfg, "slack", "channel")).toBe("off");
     expect(resolveConfiguredReplyToMode(cfg, "slack", undefined)).toBe("off");
+  });
+});
+
+describe("agent runner auto replyToMode resolution", () => {
+  it("resolves auto to first behavior when WasQueued is true", () => {
+    const wasQueued = true;
+    const rawReplyToMode = "auto" as const;
+    const replyToMode = rawReplyToMode === "auto" ? (wasQueued ? "first" : "off") : rawReplyToMode;
+    const filter = createReplyToModeFilter(replyToMode);
+
+    expect(filter({ text: "first", replyToId: "msg-1" }).replyToId).toBe("msg-1");
+    expect(filter({ text: "second", replyToId: "msg-1" }).replyToId).toBeUndefined();
+  });
+
+  it("resolves auto to off behavior when WasQueued is false or undefined", () => {
+    for (const wasQueued of [false, undefined]) {
+      const rawReplyToMode = "auto" as const;
+      const replyToMode =
+        rawReplyToMode === "auto" ? (wasQueued ? "first" : "off") : rawReplyToMode;
+      const filter = createReplyToModeFilter(replyToMode);
+
+      expect(filter({ text: "first", replyToId: "msg-1" }).replyToId).toBeUndefined();
+      expect(filter({ text: "second", replyToId: "msg-1" }).replyToId).toBeUndefined();
+    }
   });
 });
