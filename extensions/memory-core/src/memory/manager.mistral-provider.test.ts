@@ -6,11 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OLLAMA_EMBEDDING_MODEL } from "./embeddings.js";
 import type {
   EmbeddingProvider,
+  EmbeddingProviderId,
   EmbeddingProviderRuntime,
   EmbeddingProviderResult,
 } from "./embeddings.js";
 import type { MemoryIndexManager } from "./index.js";
 type MemoryIndexModule = typeof import("./index.js");
+type MemoryEmbeddingProvidersModule =
+  typeof import("../../../../src/plugins/memory-embedding-providers.js");
 
 const { createEmbeddingProviderMock } = vi.hoisted(() => ({
   createEmbeddingProviderMock: vi.fn(),
@@ -30,6 +33,8 @@ vi.mock("./sqlite-vec.js", () => ({
 
 let getMemorySearchManager: MemoryIndexModule["getMemorySearchManager"];
 let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
+let clearRegistry: MemoryEmbeddingProvidersModule["clearMemoryEmbeddingProviders"];
+let registerAdapter: MemoryEmbeddingProvidersModule["registerMemoryEmbeddingProvider"];
 
 async function ensureProviderInitialized(manager: MemoryIndexManager): Promise<void> {
   await (
@@ -80,8 +85,21 @@ describe("memory manager mistral provider wiring", () => {
   beforeEach(async () => {
     vi.resetModules();
     ({ getMemorySearchManager, closeAllMemorySearchManagers } = await import("./index.js"));
+    ({
+      clearMemoryEmbeddingProviders: clearRegistry,
+      registerMemoryEmbeddingProvider: registerAdapter,
+    } = await import("../../../../src/plugins/memory-embedding-providers.js"));
     vi.clearAllMocks();
     createEmbeddingProviderMock.mockReset();
+    clearRegistry();
+    registerAdapter({
+      id: "ollama" satisfies EmbeddingProviderId,
+      defaultModel: DEFAULT_OLLAMA_EMBEDDING_MODEL,
+      transport: "local",
+      create: async () => {
+        throw new Error("ollama adapter create should not run in manager.mistral-provider tests");
+      },
+    });
     workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-mistral-"));
     indexPath = path.join(workspaceDir, "index.sqlite");
     await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
@@ -94,6 +112,7 @@ describe("memory manager mistral provider wiring", () => {
       manager = null;
     }
     await closeAllMemorySearchManagers();
+    clearRegistry();
     if (workspaceDir) {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       workspaceDir = "";

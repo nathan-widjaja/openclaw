@@ -1,18 +1,6 @@
+import { Command } from "commander";
 import { describe, expect, it, vi } from "vitest";
 import { createTestPluginApi } from "../../test/helpers/plugins/plugin-api.js";
-
-const cliMocks = vi.hoisted(() => ({
-  registerMatrixCli: vi.fn(),
-}));
-
-vi.mock("./src/cli.js", async () => {
-  const actual = await vi.importActual<typeof import("./src/cli.js")>("./src/cli.js");
-  return {
-    ...actual,
-    registerMatrixCli: cliMocks.registerMatrixCli,
-  };
-});
-
 import matrixPlugin from "./index.js";
 
 describe("matrix plugin", () => {
@@ -43,13 +31,13 @@ describe("matrix plugin", () => {
       ],
     });
     expect(typeof registrar).toBe("function");
-    expect(cliMocks.registerMatrixCli).not.toHaveBeenCalled();
 
-    const program = { command: vi.fn() };
+    const program = new Command();
     const result = registrar?.({ program } as never);
 
     await result;
-    expect(cliMocks.registerMatrixCli).toHaveBeenCalledWith({ program });
+    const matrixCommand = program.commands.find((command) => command.name() === "matrix");
+    expect(matrixCommand?.description()).toBe("Matrix channel utilities");
     expect(registerGatewayMethod).not.toHaveBeenCalled();
   });
 

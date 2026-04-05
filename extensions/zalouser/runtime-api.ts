@@ -1,7 +1,6 @@
 // Private runtime barrel for the bundled Zalo Personal extension.
 // Keep this barrel thin and aligned with the local extension surface.
 
-export * from "./api.js";
 export { setZalouserRuntime } from "./src/runtime.js";
 export type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 export type {
