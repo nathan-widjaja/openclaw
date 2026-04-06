@@ -1,14 +1,9 @@
 import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
 
 // Mock fetchWithSsrFGuard from the local runtime seam.
-vi.mock("../../runtime-api.js", async () => {
-  const actual =
-    await vi.importActual<typeof import("../../runtime-api.js")>("../../runtime-api.js");
-  return {
-    ...actual,
-    fetchWithSsrFGuard: vi.fn(),
-  };
-});
+vi.mock("../../runtime-api.js", () => ({
+  fetchWithSsrFGuard: vi.fn(),
+}));
 
 // Mock the local Tlon upload seam.
 vi.mock("../tlon-api.js", () => ({

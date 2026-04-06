@@ -1,4 +1,4 @@
-import type { SsrFPolicy } from "../../api.js";
+import type { SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
 export {
   ssrfPolicyFromDangerouslyAllowPrivateNetwork,
   ssrfPolicyFromAllowPrivateNetwork,
