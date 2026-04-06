@@ -248,6 +248,7 @@ describe("buildStatusReply subagent summary", () => {
 
     expect(reply?.text).toContain("📌 Tasks: 2 active · 2 total");
     expect(reply?.text).toMatch(/📌 Tasks: 2 active · 2 total · (subagent|cron) · /);
+    expect(reply?.text).toContain("task ");
   });
 
   it("hides stale completed task rows from the session task line", async () => {

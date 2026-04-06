@@ -52,13 +52,13 @@ describe("task-executor-policy", () => {
     };
 
     expect(formatTaskTerminalMessage(blockedTask)).toBe(
-      "Background task blocked: ACP import (run run-1234). Needs login.",
+      "Background task blocked: ACP import (task task-1, run run-1234). Needs login. Next: I need a fresh login or credential before I can continue.",
     );
     expect(formatTaskBlockedFollowupMessage(blockedTask)).toBe(
-      "Task needs follow-up: ACP import (run run-1234). Needs login.",
+      "Task needs follow-up: ACP import (task task-1, run run-1234). Needs login. Next: I need a fresh login or credential before I can continue.",
     );
     expect(formatTaskStateChangeMessage(blockedTask, progressEvent)).toBe(
-      "Background task update: ACP import. No output for 60s.",
+      "Background task update: ACP import (task task-1, run run-1234). Current step: No output for 60s. Next: I need a fresh login or credential before I can continue.",
     );
   });
 
@@ -91,13 +91,13 @@ describe("task-executor-policy", () => {
     };
 
     expect(formatTaskTerminalMessage(blockedTask)).toBe(
-      "Background task blocked: Background task (run run-1234).",
+      "Background task blocked: Background task (task task-1, run run-1234). Next: I need follow-up to continue.",
     );
     expect(formatTaskBlockedFollowupMessage(blockedTask)).toBe(
-      "Task needs follow-up: Background task (run run-1234). Task is blocked and needs follow-up.",
+      "Task needs follow-up: Background task (task task-1, run run-1234). Task is blocked and needs follow-up. Next: I need follow-up to continue.",
     );
     expect(formatTaskTerminalMessage(failedTask)).toBe(
-      "Background task failed: Background task (run run-2234). Needs manual approval.",
+      "Background task failed: Background task (task task-1, run run-2234). Needs manual approval. Next: The work stopped before finishing.",
     );
     expect(formatTaskStateChangeMessage(blockedTask, progressEvent)).toBeNull();
   });
@@ -112,10 +112,10 @@ describe("task-executor-policy", () => {
     });
 
     expect(formatTaskTerminalMessage(blockedTask)).toBe(
-      "Background task blocked: ACP import (run run-1234). Command did not run: approval timed out.",
+      "Background task blocked: ACP import (task task-1, run run-1234). Command did not run: approval timed out. Next: I need approval before I can continue.",
     );
     expect(formatTaskBlockedFollowupMessage(blockedTask)).toBe(
-      "Task needs follow-up: ACP import (run run-1234). Command did not run: approval timed out.",
+      "Task needs follow-up: ACP import (task task-1, run run-1234). Command did not run: approval timed out. Next: I need approval before I can continue.",
     );
   });
 

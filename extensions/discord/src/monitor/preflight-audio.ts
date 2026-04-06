@@ -70,6 +70,7 @@ export async function resolveDiscordPreflightAudioMentionContext(params: {
           },
           cfg: params.cfg,
           agentDir: undefined,
+          requiredForActivation: true,
         });
         if (params.abortSignal?.aborted) {
           transcript = undefined;

@@ -9,6 +9,10 @@ import {
 } from "../../tasks/task-status-access.js";
 import {
   buildTaskStatusSnapshot,
+  extractTaskArtifactHint,
+  formatTaskDeliverySummary,
+  formatTaskNextAction,
+  formatTaskShortId,
   formatTaskStatusDetail,
   formatTaskStatusTitle,
 } from "../../tasks/task-status.js";
@@ -70,10 +74,31 @@ function formatVisibleTask(task: TaskRecord, index: number): string {
   const status = task.status.replaceAll("_", " ");
   const timing = formatTaskTiming(task);
   const detail = formatTaskDetail(task);
-  const meta = [TASK_RUNTIME_LABELS[task.runtime], status, timing].filter(Boolean).join(" · ");
+  const taskId = formatTaskShortId(task);
+  const artifact = extractTaskArtifactHint(task);
+  const delivery = formatTaskDeliverySummary(task);
+  const nextAction = formatTaskNextAction(task);
+  const detailLabel = task.status === "queued" || task.status === "running" ? "Step" : "Outcome";
+  const meta = [
+    TASK_RUNTIME_LABELS[task.runtime],
+    status,
+    timing,
+    taskId ? `task ${taskId}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const lines = [`${index + 1}. ${TASK_STATUS_ICONS[task.status]} ${title}`, `   ${meta}`];
   if (detail) {
-    lines.push(`   ${detail}`);
+    lines.push(`   ${detailLabel}: ${detail}`);
+  }
+  if (artifact) {
+    lines.push(`   Artifact: ${artifact}`);
+  }
+  if (delivery) {
+    lines.push(`   Delivery: ${delivery}`);
+  }
+  if (nextAction) {
+    lines.push(`   Next: ${nextAction}`);
   }
   return lines.join("\n");
 }

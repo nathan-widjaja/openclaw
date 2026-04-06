@@ -95,6 +95,9 @@ describe("buildTelegramMessageContext audio transcript body", () => {
     });
 
     expect(transcribeFirstAudioMock).toHaveBeenCalledTimes(1);
+    expect(transcribeFirstAudioMock).toHaveBeenCalledWith(
+      expect.objectContaining({ requiredForActivation: true }),
+    );
     expectTranscriptRendered(ctx, "hey bot please help");
   });
 
@@ -134,6 +137,9 @@ describe("buildTelegramMessageContext audio transcript body", () => {
     });
 
     expect(transcribeFirstAudioMock).toHaveBeenCalledTimes(1);
+    expect(transcribeFirstAudioMock).toHaveBeenCalledWith(
+      expect.objectContaining({ requiredForActivation: true }),
+    );
     expectTranscriptRendered(ctx, "topic override transcript");
   });
 

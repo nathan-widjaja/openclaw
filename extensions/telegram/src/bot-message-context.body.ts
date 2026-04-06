@@ -203,6 +203,7 @@ export async function resolveTelegramInboundBody(params: {
         ctx: tempCtx,
         cfg,
         agentDir: undefined,
+        requiredForActivation: isGroup && Boolean(requireMention),
       });
     } catch (err) {
       logVerbose(`telegram: audio preflight transcription failed: ${String(err)}`);

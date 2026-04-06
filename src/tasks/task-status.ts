@@ -11,6 +11,13 @@ const FAILURE_TASK_STATUSES = new Set(["failed", "timed_out", "lost"]);
 export const TASK_STATUS_RECENT_WINDOW_MS = 5 * 60_000;
 export const TASK_STATUS_TITLE_MAX_CHARS = 80;
 export const TASK_STATUS_DETAIL_MAX_CHARS = 120;
+export const TASK_STATUS_OPERATOR_STEP_MAX_CHARS = 180;
+
+const TASK_OPERATOR_PATH_PATTERNS = [
+  /https?:\/\/[^\s"'`<>()]+/i,
+  /(?:~|\/(?:Users|tmp|var|private|home|opt|Volumes|mnt|etc|srv|usr|Applications)\b)[^\s"'`<>()]*/u,
+  /[A-Za-z]:\\[^\s"'`<>()]+/u,
+];
 
 function isActiveTask(task: TaskRecord): boolean {
   return ACTIVE_TASK_STATUSES.has(task.status);
@@ -44,6 +51,14 @@ function truncateTaskStatusText(value: string, maxChars: number): string {
     return trimmed;
   }
   return `${truncateUtf16Safe(trimmed, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function formatTaskShortIdText(value: string | undefined, maxChars = 8): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return truncateTaskStatusText(trimmed, maxChars);
 }
 
 function stripInlineLeakedInternalContext(value: string): string {
@@ -146,6 +161,130 @@ export function formatTaskStatusDetail(task: TaskRecord): string | undefined {
       maxChars: TASK_STATUS_DETAIL_MAX_CHARS,
     }) || undefined
   );
+}
+
+function extractTaskArtifactFromText(value: string | undefined): string | undefined {
+  const text = sanitizeTaskStatusText(value, { errorContext: true });
+  if (!text) {
+    return undefined;
+  }
+  for (const pattern of TASK_OPERATOR_PATH_PATTERNS) {
+    const match = text.match(pattern);
+    const candidate = match?.[0]?.trim().replace(/[.,;:!?]+$/, "");
+    if (candidate) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function resolveBlockedTaskNextAction(task: TaskRecord): string {
+  const context = [
+    sanitizeTaskStatusText(task.terminalSummary, { errorContext: true }),
+    sanitizeTaskStatusText(task.error, { errorContext: true }),
+    sanitizeTaskStatusText(task.progressSummary),
+  ]
+    .filter(Boolean)
+    .join(" ");
+  if (/\b(log(?: ?)?in|sign(?:ed)? ?in|auth|credential|oauth|token)\b/i.test(context)) {
+    return "I need a fresh login or credential before I can continue";
+  }
+  if (
+    /\b(approval|approve|authorized?|authorization|permission|writable session|apply_patch)\b/i.test(
+      context,
+    )
+  ) {
+    return "I need approval before I can continue";
+  }
+  return "I need follow-up to continue";
+}
+
+export function formatTaskShortId(task: TaskRecord, maxChars = 8): string | undefined {
+  return formatTaskShortIdText(task.taskId, maxChars);
+}
+
+export function formatTaskOperatorStep(task: TaskRecord): string | undefined {
+  if (task.status === "queued" || task.status === "running") {
+    const detail = sanitizeTaskStatusText(task.progressSummary, {
+      maxChars: TASK_STATUS_OPERATOR_STEP_MAX_CHARS,
+    });
+    if (detail) {
+      return detail;
+    }
+    return task.status === "queued" ? "Waiting to start." : "Started.";
+  }
+  return undefined;
+}
+
+export function formatTaskOperatorOutcome(task: TaskRecord): string | undefined {
+  const error = sanitizeTaskStatusText(task.error, {
+    errorContext: true,
+    maxChars: TASK_STATUS_OPERATOR_STEP_MAX_CHARS,
+  });
+  if (error) {
+    return error;
+  }
+  return (
+    sanitizeTaskStatusText(task.terminalSummary, {
+      errorContext: true,
+      maxChars: TASK_STATUS_OPERATOR_STEP_MAX_CHARS,
+    }) || undefined
+  );
+}
+
+export function extractTaskArtifactHint(task: TaskRecord): string | undefined {
+  return (
+    extractTaskArtifactFromText(task.terminalSummary) ??
+    extractTaskArtifactFromText(task.progressSummary) ??
+    extractTaskArtifactFromText(task.error)
+  );
+}
+
+export function formatTaskDeliverySummary(task: TaskRecord): string | undefined {
+  switch (task.deliveryStatus) {
+    case "failed":
+      return "chat delivery failed";
+    case "session_queued":
+      return "saved for the local session";
+    case "parent_missing":
+      return "original requester unavailable";
+    default:
+      return undefined;
+  }
+}
+
+export function formatTaskNextAction(task: TaskRecord): string | undefined {
+  if (task.status === "queued" || task.status === "running") {
+    return "I'll keep working and report back here";
+  }
+  if (task.status === "succeeded") {
+    if (task.terminalOutcome === "blocked") {
+      return resolveBlockedTaskNextAction(task);
+    }
+    if (task.deliveryStatus === "failed") {
+      return "The work finished, but sending the result back to chat failed";
+    }
+    if (task.deliveryStatus === "session_queued") {
+      return "The result was saved for the local session because direct chat delivery was not available";
+    }
+    return undefined;
+  }
+  if (task.status === "timed_out") {
+    return "I hit the time limit before finishing";
+  }
+  if (task.status === "cancelled") {
+    return "The work was stopped before it finished";
+  }
+  if (task.status === "lost") {
+    return "The backing runtime disappeared, so this needs a retry";
+  }
+  if (task.deliveryStatus === "failed") {
+    return "The work stopped, and sending the details back to chat also failed";
+  }
+  if (task.deliveryStatus === "session_queued") {
+    return "The work stopped, and the details were saved for the local session";
+  }
+  return "The work stopped before finishing";
 }
 
 export type TaskStatusSnapshot = {

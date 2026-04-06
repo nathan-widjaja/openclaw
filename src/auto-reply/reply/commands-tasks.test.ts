@@ -69,7 +69,13 @@ describe("buildTasksReply", () => {
     expect(reply.text).toContain("🟢 active background task");
     expect(reply.text).toContain("🟡 queued background task");
     expect(reply.text).toContain("🔴 failed background task");
-    expect(reply.text).toContain("approval denied");
+    expect(reply.text).toContain("task ");
+    expect(reply.text).toContain("Step: still working");
+    expect(reply.text).toContain("Outcome: approval denied");
+    expect(reply.text).toContain("Next: I'll keep working and report back here");
+    expect(reply.text).toContain(
+      "Next: The work stopped, and the details were saved for the local session",
+    );
   });
 
   it("sanitizes leaked internal runtime context from visible task details", async () => {

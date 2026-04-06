@@ -251,6 +251,70 @@ so you still get an overview without leaking other-session details.
 
 For the full operator ledger, use the CLI: `openclaw tasks list`.
 
+## Remote operator runbook
+
+When you are driving OpenClaw from Telegram or another remote channel, treat the channel as the
+**command plane** and the local UI/logs as the **observability plane**.
+
+- Use chat to start work, answer follow-up questions, and get concise progress updates.
+- Use `/tasks` in chat for a quick operator board tied to the current session.
+- Use the Control UI, task ledger, and logs when you need to inspect what actually happened.
+
+Recommended operator loop:
+
+```bash
+# Confirm the gateway runtime and channel bindings are healthy
+openclaw gateway status --deep
+
+# Check session/runtime health, model/auth state, and any surfaced task issues
+openclaw status --deep
+
+# Inspect the full task ledger, not just the current chat session
+openclaw tasks list
+
+# Follow live runtime logs while a remote task is working
+openclaw logs --follow
+
+# Run the built-in health checks when the remote surface feels off
+openclaw doctor
+```
+
+### What to expect from remote task updates
+
+Task updates are intentionally **operator-facing**, not transcript-complete. Remote replies can now
+surface:
+
+- task ID
+- current step
+- outcome summary
+- artifact hints such as file paths or URLs
+- delivery status when chat delivery falls back to the local session
+- a plain-English next action
+
+That means Telegram does not need to mirror the full local transcript to feel reliable. The
+important contract is:
+
+1. chat tells you what task is happening and what to do next
+2. `/tasks` shows the session-linked work board
+3. the Control UI and logs show the full execution truth when you need to inspect deeper
+
+### Troubleshooting remote parity
+
+If remote behavior feels weaker than local behavior, check the layers in this order:
+
+1. `openclaw gateway status --deep`
+2. `openclaw status --deep`
+3. `openclaw tasks list`
+4. `openclaw logs --follow`
+5. `openclaw doctor`
+
+Common causes are:
+
+- direct chat delivery failed, so the result was saved for the local session instead
+- the task is blocked on approval, auth, or follow-up
+- a channel-specific transport step failed even though the underlying task succeeded
+- media preflight or local transcription degraded because of timeout or concurrency limits
+
 ## Status integration (task pressure)
 
 `openclaw status` includes an at-a-glance task summary:

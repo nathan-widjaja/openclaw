@@ -3,12 +3,56 @@ import type { OpenClawConfig } from "../config/config.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
 import { isAudioAttachment } from "./attachments.js";
 import { runAudioTranscription } from "./audio-transcription-runner.js";
+import { DEFAULT_TIMEOUT_SECONDS } from "./defaults.js";
+import { resolveConcurrency } from "./resolve.js";
 import {
   type ActiveMediaModel,
   normalizeMediaAttachments,
   resolveMediaAttachmentLocalRoots,
 } from "./runner.js";
 import type { MediaUnderstandingProvider } from "./types.js";
+
+const AUDIO_PREFLIGHT_TIMEOUT_CAP_SECONDS = 15;
+const MAX_AUDIO_PREFLIGHT_CONCURRENCY = 2;
+
+let activeAudioPreflights = 0;
+
+function resolveAudioPreflightTimeoutSeconds(cfg: OpenClawConfig): number {
+  const configured = cfg.tools?.media?.audio?.timeoutSeconds;
+  const normalized =
+    typeof configured === "number" && Number.isFinite(configured) && configured > 0
+      ? configured
+      : DEFAULT_TIMEOUT_SECONDS.audio;
+  return Math.min(normalized, AUDIO_PREFLIGHT_TIMEOUT_CAP_SECONDS);
+}
+
+function resolveAudioPreflightConcurrencyLimit(cfg: OpenClawConfig): number {
+  return Math.max(1, Math.min(resolveConcurrency(cfg), MAX_AUDIO_PREFLIGHT_CONCURRENCY));
+}
+
+function buildAudioPreflightConfig(cfg: OpenClawConfig, timeoutSeconds: number): OpenClawConfig {
+  const audio = cfg.tools?.media?.audio;
+  if (audio?.timeoutSeconds === timeoutSeconds) {
+    return cfg;
+  }
+  return {
+    ...cfg,
+    tools: {
+      ...cfg.tools,
+      media: {
+        ...cfg.tools?.media,
+        audio: {
+          ...audio,
+          timeoutSeconds,
+        },
+      },
+    },
+  };
+}
+
+export function resetAudioPreflightStateForTests(): void {
+  activeAudioPreflights = 0;
+}
 
 /**
  * Transcribes the first audio attachment BEFORE mention checking.
@@ -21,6 +65,7 @@ export async function transcribeFirstAudio(params: {
   agentDir?: string;
   providers?: Record<string, MediaUnderstandingProvider>;
   activeModel?: ActiveMediaModel;
+  requiredForActivation?: boolean;
 }): Promise<string | undefined> {
   const { ctx, cfg } = params;
 
@@ -48,15 +93,34 @@ export async function transcribeFirstAudio(params: {
     logVerbose(`audio-preflight: transcribing attachment ${firstAudio.index} for mention check`);
   }
 
+  const concurrencyLimit = resolveAudioPreflightConcurrencyLimit(cfg);
+  const requiredForActivation = params.requiredForActivation === true;
+  if (activeAudioPreflights >= concurrencyLimit && !requiredForActivation) {
+    if (shouldLogVerbose()) {
+      logVerbose(
+        `audio-preflight: busy (${activeAudioPreflights}/${concurrencyLimit}); skipping mention-check transcription for attachment ${firstAudio.index}`,
+      );
+    }
+    return undefined;
+  }
+  if (activeAudioPreflights >= concurrencyLimit && shouldLogVerbose()) {
+    logVerbose(
+      `audio-preflight: busy (${activeAudioPreflights}/${concurrencyLimit}); continuing transcription for attachment ${firstAudio.index} because activation depends on it`,
+    );
+  }
+
+  const preflightTimeoutSeconds = resolveAudioPreflightTimeoutSeconds(cfg);
+  const preflightCfg = buildAudioPreflightConfig(cfg, preflightTimeoutSeconds);
+  activeAudioPreflights += 1;
   try {
     const { transcript } = await runAudioTranscription({
       ctx,
-      cfg,
+      cfg: preflightCfg,
       attachments,
       agentDir: params.agentDir,
       providers: params.providers,
       activeModel: params.activeModel,
-      localPathRoots: resolveMediaAttachmentLocalRoots({ cfg, ctx }),
+      localPathRoots: resolveMediaAttachmentLocalRoots({ cfg: preflightCfg, ctx }),
     });
     if (!transcript) {
       return undefined;
@@ -78,5 +142,7 @@ export async function transcribeFirstAudio(params: {
       logVerbose(`audio-preflight: transcription failed: ${String(err)}`);
     }
     return undefined;
+  } finally {
+    activeAudioPreflights = Math.max(0, activeAudioPreflights - 1);
   }
 }

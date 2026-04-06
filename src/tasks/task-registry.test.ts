@@ -618,9 +618,21 @@ describe("task-registry", () => {
         }),
       );
       expect(peekSystemEvents("agent:main:main")).toEqual([
-        "Background task blocked: ACP background task (run run-deli). Writable session or apply_patch authorization required.",
-        "Task needs follow-up: ACP background task (run run-deli). Writable session or apply_patch authorization required.",
+        expect.stringContaining("Background task blocked: ACP background task"),
+        expect.stringContaining("Task needs follow-up: ACP background task"),
       ]);
+      expect(peekSystemEvents("agent:main:main")[0]).toContain(
+        "Writable session or apply_patch authorization required.",
+      );
+      expect(peekSystemEvents("agent:main:main")[0]).toContain(
+        "Next: I need approval before I can continue.",
+      );
+      expect(peekSystemEvents("agent:main:main")[1]).toContain(
+        "Writable session or apply_patch authorization required.",
+      );
+      expect(peekSystemEvents("agent:main:main")[1]).toContain(
+        "Next: I need approval before I can continue.",
+      );
       expect(hasPendingHeartbeatWake()).toBe(true);
     });
   });
@@ -689,9 +701,21 @@ describe("task-registry", () => {
         }),
       );
       expect(peekSystemEvents("agent:main:main")).toEqual([
-        "Background task blocked: ACP background task (run run-sess). Writable session or apply_patch authorization required.",
-        "Task needs follow-up: ACP background task (run run-sess). Writable session or apply_patch authorization required.",
+        expect.stringContaining("Background task blocked: ACP background task"),
+        expect.stringContaining("Task needs follow-up: ACP background task"),
       ]);
+      expect(peekSystemEvents("agent:main:main")[0]).toContain(
+        "Writable session or apply_patch authorization required.",
+      );
+      expect(peekSystemEvents("agent:main:main")[0]).toContain(
+        "Next: I need approval before I can continue.",
+      );
+      expect(peekSystemEvents("agent:main:main")[1]).toContain(
+        "Writable session or apply_patch authorization required.",
+      );
+      expect(peekSystemEvents("agent:main:main")[1]).toContain(
+        "Next: I need approval before I can continue.",
+      );
       expect(hasPendingHeartbeatWake()).toBe(true);
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
     });
@@ -742,7 +766,7 @@ describe("task-registry", () => {
       await waitForAssertion(() =>
         expect(hoisted.sendMessageMock).toHaveBeenCalledWith(
           expect.objectContaining({
-            content: "Background task done: ACP background task (run run-deta).",
+            content: expect.stringContaining("Background task done: ACP background task"),
           }),
         ),
       );
@@ -779,14 +803,25 @@ describe("task-registry", () => {
       await waitForAssertion(() =>
         expect(hoisted.sendMessageMock).toHaveBeenCalledWith(
           expect.objectContaining({
-            content:
-              "Background task blocked: ACP background task (run run-bloc). Writable session or apply_patch authorization required.",
+            content: expect.stringContaining("Background task blocked: ACP background task"),
           }),
         ),
       );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Writable session or apply_patch authorization required.",
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Next: I need approval before I can continue.",
+      );
       expect(peekSystemEvents("agent:main:main")).toEqual([
-        "Task needs follow-up: ACP background task (run run-bloc). Writable session or apply_patch authorization required.",
+        expect.stringContaining("Task needs follow-up: ACP background task"),
       ]);
+      expect(peekSystemEvents("agent:main:main")[0]).toContain(
+        "Writable session or apply_patch authorization required.",
+      );
+      expect(peekSystemEvents("agent:main:main")[0]).toContain(
+        "Next: I need approval before I can continue.",
+      );
       expect(hasPendingHeartbeatWake()).toBe(true);
     });
   });
@@ -821,10 +856,15 @@ describe("task-registry", () => {
       await waitForAssertion(() =>
         expect(hoisted.sendMessageMock).toHaveBeenCalledWith(
           expect.objectContaining({
-            content:
-              "Background task done: ACP background task (run run-succ). Created /tmp/file.txt and verified contents.",
+            content: expect.stringContaining("Background task done: ACP background task"),
           }),
         ),
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Created /tmp/file.txt and verified contents.",
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Artifact: /tmp/file.txt.",
       );
       expect(peekSystemEvents("agent:main:main")).toEqual([]);
       expect(hasPendingHeartbeatWake()).toBe(false);
@@ -1573,10 +1613,15 @@ describe("task-registry", () => {
       await waitForAssertion(() =>
         expect(hoisted.sendMessageMock).toHaveBeenCalledWith(
           expect.objectContaining({
-            content:
-              "Background task update: ACP background task. No output for 60s. It may be waiting for input.",
+            content: expect.stringContaining("Background task update: ACP background task"),
           }),
         ),
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Current step: No output for 60s. It may be waiting for input.",
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Next: I'll keep working and report back here.",
       );
       expect(findTaskByRunId("run-state-change")).toMatchObject({
         notifyPolicy: "state_changes",
@@ -1651,7 +1696,7 @@ describe("task-registry", () => {
         expect.objectContaining({
           channel: "discord",
           to: "discord:123",
-          content: "Background task done: ACP background task (run run-quie).",
+          content: expect.stringContaining("Background task done: ACP background task"),
         }),
       );
       expect(peekSystemEvents("agent:main:main")).toEqual([]);
@@ -1703,9 +1748,14 @@ describe("task-registry", () => {
         expect.objectContaining({
           channel: "discord",
           to: "discord:123",
-          content:
-            "Background task failed: ACP background task (run run-fail). Permission denied by ACP runtime",
+          content: expect.stringContaining("Background task failed: ACP background task"),
         }),
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Permission denied by ACP runtime.",
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Next: The work stopped before finishing.",
       );
       expect(peekSystemEvents("agent:main:main")).toEqual([]);
     });
@@ -1754,8 +1804,14 @@ describe("task-registry", () => {
       await flushAsyncWork();
       expect(hoisted.sendMessageMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          content: "Background task update: ACP background task. Started.",
+          content: expect.stringContaining("Background task update: ACP background task"),
         }),
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Current step: Started.",
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Next: I'll keep working and report back here.",
       );
 
       hoisted.sendMessageMock.mockClear();
@@ -1763,9 +1819,14 @@ describe("task-registry", () => {
       await flushAsyncWork();
       expect(hoisted.sendMessageMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          content:
-            "Background task update: ACP background task. No output for 1s. It may be waiting for input.",
+          content: expect.stringContaining("Background task update: ACP background task"),
         }),
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Current step: No output for 1s. It may be waiting for input.",
+      );
+      expect(hoisted.sendMessageMock.mock.calls.at(-1)?.[0]?.content).toContain(
+        "Next: I'll keep working and report back here.",
       );
 
       expect(peekSystemEvents("agent:main:main")).toEqual([]);
@@ -1823,7 +1884,7 @@ describe("task-registry", () => {
             expect.objectContaining({
               channel: "telegram",
               to: "telegram:123",
-              content: "Background task cancelled: ACP background task (run run-canc).",
+              content: expect.stringContaining("Background task cancelled: ACP background task"),
             }),
           ),
         );
@@ -1884,7 +1945,7 @@ describe("task-registry", () => {
             expect.objectContaining({
               channel: "telegram",
               to: "telegram:123",
-              content: "Background task cancelled: Subagent task (run run-canc).",
+              content: expect.stringContaining("Background task cancelled: Subagent task"),
             }),
           ),
         );
