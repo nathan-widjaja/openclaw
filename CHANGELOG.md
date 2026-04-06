@@ -7,10 +7,12 @@ Docs: https://docs.openclaw.ai
 ### Added
 
 - CLI/live control: add `openclaw live` commands for `status`, `start`, `propose`, `promote`, and `journal`, backed by a persisted live-control manifest, journal, and dedicated draft worktrees under `~/.openclaw/live-control/`, so Codex and Telegram-driven changes can share one clean live lane with explicit draft promotion.
+- CLI/live control: add `openclaw live sync` plus a repo-owned `scripts/upstream-sync.mjs` workflow and weekly GitHub Action so fork-backed installs can batch upstream OpenClaw updates into reviewed PRs, then apply `origin/main` locally with lock-aware install, restart, smoke-check, and rollback protection.
 
 ### Changed
 
 - CLI/live status: treat an inactive watcher as a normal stable-mode state instead of a live-lane issue, show clean vs dirty state for each draft worktree, and document the control-plane workflow in the CLI docs plus repo-local operator guidance.
+- CLI/live sync and upstream PR prep now pin GitHub operations to the fork remote, ignore cross-repository sync PRs, and keep `--dry-run` isolated in a temporary worktree so preview runs stop mutating the caller checkout.
 
 ### Fixes
 
