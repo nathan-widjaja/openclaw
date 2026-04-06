@@ -217,8 +217,14 @@ function expectPluginSdkAliasTargets(
   expect(fs.realpathSync(aliases["openclaw/plugin-sdk"] ?? "")).toBe(
     fs.realpathSync(params.rootAliasPath),
   );
+  expect(fs.realpathSync(aliases["@openclaw/plugin-sdk"] ?? "")).toBe(
+    fs.realpathSync(params.rootAliasPath),
+  );
   if (params.channelRuntimePath) {
     expect(fs.realpathSync(aliases["openclaw/plugin-sdk/channel-runtime"] ?? "")).toBe(
+      fs.realpathSync(params.channelRuntimePath),
+    );
+    expect(fs.realpathSync(aliases["@openclaw/plugin-sdk/channel-runtime"] ?? "")).toBe(
       fs.realpathSync(params.channelRuntimePath),
     );
   }
@@ -711,7 +717,7 @@ describe("plugin sdk alias helpers", () => {
     fs.writeFileSync(jitiBaseFile, "export {};\n", "utf-8");
     fs.writeFileSync(
       path.join(copiedSourceDir, "channel.runtime.ts"),
-      `import { resolveOutboundSendDep } from "openclaw/plugin-sdk/infra-runtime";
+      `import { resolveOutboundSendDep } from "@openclaw/plugin-sdk/infra-runtime";
 
 export const syntheticRuntimeMarker = {
   resolveOutboundSendDep,
@@ -741,6 +747,7 @@ export const syntheticRuntimeMarker = {
     const withAlias = createJiti(jitiBaseUrl, {
       ...buildPluginLoaderJitiOptions({
         "openclaw/plugin-sdk/infra-runtime": copiedChannelRuntimeShim,
+        "@openclaw/plugin-sdk/infra-runtime": copiedChannelRuntimeShim,
       }),
       tryNative: false,
     });
