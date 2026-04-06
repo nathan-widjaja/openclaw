@@ -517,6 +517,11 @@ export type ToolsConfig = {
     x_search?: {
       /** Enable X search tool (default: true when xAI auth is available via plugin config or XAI_API_KEY). */
       enabled?: boolean;
+      /**
+       * @deprecated Use plugins.entries.xai.config.webSearch.apiKey instead.
+       * Kept for legacy runtime migration and doctor-guided repair.
+       */
+      apiKey?: SecretInput;
       /** Model id to use for X search. */
       model?: string;
       /** Keep inline citations in the xAI response payload when available. */
