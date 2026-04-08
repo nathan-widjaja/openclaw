@@ -4,7 +4,7 @@ import { formatDurationCompact } from "../../infra/format-time/format-duration.t
 import { formatTimeAgo } from "../../infra/format-time/format-relative.ts";
 import type { TaskRecord } from "../../tasks/task-registry.types.js";
 import {
-  listTasksForAgentIdForStatus,
+  listAutomationTasksForAgentIdForStatus,
   listTasksForSessionKeyForStatus,
 } from "../../tasks/task-status-access.js";
 import {
@@ -45,12 +45,12 @@ function formatTaskHeadline(snapshot: ReturnType<typeof buildTaskStatusSnapshot>
   return `Current session: ${snapshot.activeCount} active · ${snapshot.totalCount} total`;
 }
 
-function formatAgentFallbackLine(agentId: string): string | undefined {
-  const snapshot = buildTaskStatusSnapshot(listTasksForAgentIdForStatus(agentId));
+function formatAutomationLine(agentId: string): string | undefined {
+  const snapshot = buildTaskStatusSnapshot(listAutomationTasksForAgentIdForStatus(agentId));
   if (snapshot.totalCount === 0) {
     return undefined;
   }
-  return `Agent-local: ${snapshot.activeCount} active · ${snapshot.totalCount} total`;
+  return `Automation: ${snapshot.activeCount} active · ${snapshot.totalCount} total`;
 }
 
 function formatTaskTiming(task: TaskRecord): string | undefined {
@@ -108,6 +108,7 @@ export function buildTasksText(params: { sessionKey: string; agentId: string }):
     listTasksForSessionKeyForStatus(params.sessionKey),
   );
   const lines = ["📋 Tasks", formatTaskHeadline(sessionSnapshot)];
+  const automationLine = formatAutomationLine(params.agentId);
 
   if (sessionSnapshot.totalCount > 0) {
     const visible = sessionSnapshot.visible.slice(0, MAX_VISIBLE_TASKS);
@@ -122,12 +123,14 @@ export function buildTasksText(params: { sessionKey: string; agentId: string }):
     if (hiddenCount > 0) {
       lines.push("", `+${hiddenCount} more recent task${hiddenCount === 1 ? "" : "s"}`);
     }
+    if (automationLine) {
+      lines.push("", automationLine);
+    }
     return lines.join("\n");
   }
 
-  const agentFallback = formatAgentFallbackLine(params.agentId);
-  if (agentFallback) {
-    lines.push(agentFallback);
+  if (automationLine) {
+    lines.push(automationLine);
   }
   return lines.join("\n");
 }
