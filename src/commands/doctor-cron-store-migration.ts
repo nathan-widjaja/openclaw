@@ -2,6 +2,7 @@ import { parseAbsoluteTimeMs } from "../cron/parse.js";
 import { coerceFiniteScheduleNumber } from "../cron/schedule.js";
 import { inferLegacyName, normalizeOptionalText } from "../cron/service/normalize.js";
 import { normalizeCronStaggerMs, resolveDefaultCronStaggerMs } from "../cron/stagger.js";
+import { isCronSessionKey } from "../routing/session-key.js";
 import { normalizeLegacyDeliveryInput } from "./doctor-cron-legacy-delivery.js";
 import { migrateLegacyCronPayload } from "./doctor-cron-payload-migration.js";
 
@@ -13,7 +14,8 @@ type CronStoreIssueKey =
   | "legacyPayloadProvider"
   | "legacyTopLevelPayloadFields"
   | "legacyTopLevelDeliveryFields"
-  | "legacyDeliveryMode";
+  | "legacyDeliveryMode"
+  | "missingToolsAllow";
 
 type CronStoreIssues = Partial<Record<CronStoreIssueKey, number>>;
 
@@ -25,6 +27,10 @@ type NormalizeCronStoreJobsResult = {
 
 function incrementIssue(issues: CronStoreIssues, key: CronStoreIssueKey) {
   issues[key] = (issues[key] ?? 0) + 1;
+}
+
+function isDedicatedAutomationCronSession(sessionKey: unknown): boolean {
+  return typeof sessionKey === "string" && isCronSessionKey(sessionKey);
 }
 
 function normalizePayloadKind(payload: Record<string, unknown>) {
@@ -505,16 +511,23 @@ export function normalizeStoredCronJobs(
       payload: payloadRecord,
     });
 
+    const isDedicatedAutomationSession = isDedicatedAutomationCronSession(raw.sessionKey);
     if (isIsolatedAgentTurn && payloadKind === "agentTurn") {
       if (!hasDelivery && normalizedLegacy.delivery) {
         raw.delivery = normalizedLegacy.delivery;
         mutated = true;
       } else if (!hasDelivery) {
-        raw.delivery = { mode: "announce" };
+        raw.delivery = isDedicatedAutomationSession ? { mode: "none" } : { mode: "announce" };
         mutated = true;
       } else if (normalizedLegacy.mutated && normalizedLegacy.delivery) {
         raw.delivery = normalizedLegacy.delivery;
         mutated = true;
+      }
+      if (
+        isDedicatedAutomationSession &&
+        (!payloadRecord || !Array.isArray((payloadRecord as { toolsAllow?: unknown }).toolsAllow))
+      ) {
+        trackIssue("missingToolsAllow");
       }
     } else if (normalizedLegacy.mutated && normalizedLegacy.delivery) {
       raw.delivery = normalizedLegacy.delivery;

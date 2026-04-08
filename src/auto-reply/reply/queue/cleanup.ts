@@ -1,5 +1,6 @@
 import { resolveEmbeddedSessionLane } from "../../../agents/pi-embedded-runner/lanes.js";
 import { clearCommandLane } from "../../../process/command-queue.js";
+import { clearQueuedFollowupLifecycleForQueue } from "../queue-lifecycle.js";
 import { clearFollowupDrainCallback } from "./drain.js";
 import { clearFollowupQueue } from "./state.js";
 
@@ -63,6 +64,7 @@ export function clearSessionQueues(keys: Array<string | undefined>): ClearSessio
     }
     seen.add(cleaned);
     clearedKeys.push(cleaned);
+    clearQueuedFollowupLifecycleForQueue(cleaned);
     followupCleared += clearFollowupQueue(cleaned);
     clearFollowupDrainCallback(cleaned);
     laneCleared += clearLane(resolveLane(cleaned));
