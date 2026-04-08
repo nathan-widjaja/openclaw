@@ -1,6 +1,11 @@
 # Repository Guidelines
 
 - Repo: https://github.com/openclaw/openclaw
+- Nathan fork policy for this checkout:
+  Treat `origin` (`https://github.com/nathan-widjaja/openclaw.git`) as the canonical publish and merge target.
+  Treat `upstream` (`https://github.com/openclaw/openclaw.git`) as read-only sync input unless Nathan explicitly asks to contribute upstream.
+  For `/ship`, `/land-and-deploy`, GitHub CLI actions, and "sync main" requests in this checkout, always target `origin` or pass `--repo nathan-widjaja/openclaw` explicitly instead of relying on `gh` defaults.
+  If the request says merge, ship, push, or sync `main` without naming `upstream`, use `origin/main`.
 - In chat replies, file references must be repo-root relative only (example: `src/telegram/index.ts:80`); never absolute paths or `~/...`.
 - Do not edit files covered by security-focused `CODEOWNERS` rules unless a listed owner explicitly asked for the change or is already reviewing it with you. Treat those paths as restricted surfaces, not drive-by cleanup.
 
