@@ -23,7 +23,7 @@ import {
 } from "../../infra/provider-usage.js";
 import type { MediaUnderstandingDecision } from "../../media-understanding/types.js";
 import {
-  listTasksForAgentIdForStatus,
+  listAutomationTasksForAgentIdForStatus,
   listTasksForSessionKeyForStatus,
 } from "../../tasks/task-status-access.js";
 import {
@@ -84,12 +84,12 @@ function formatSessionTaskLine(sessionKey: string): string | undefined {
   return parts.length ? `📌 Tasks: ${parts.join(" · ")}` : undefined;
 }
 
-function formatAgentTaskCountsLine(agentId: string): string | undefined {
-  const snapshot = buildTaskStatusSnapshot(listTasksForAgentIdForStatus(agentId));
+function formatAutomationTaskCountsLine(agentId: string): string | undefined {
+  const snapshot = buildTaskStatusSnapshot(listAutomationTasksForAgentIdForStatus(agentId));
   if (snapshot.totalCount === 0) {
     return undefined;
   }
-  return `📌 Tasks: ${snapshot.activeCount} active · ${snapshot.totalCount} total · agent-local`;
+  return `📌 Automation: ${snapshot.activeCount} active · ${snapshot.totalCount} total`;
 }
 
 export async function buildStatusReply(params: {
@@ -264,14 +264,20 @@ export async function buildStatusText(params: {
 
   let subagentsLine: string | undefined;
   let taskLine: string | undefined;
+  let automationTaskLine: string | undefined;
   if (sessionKey) {
     const { mainKey, alias } = resolveMainSessionAlias(cfg);
     const requesterKey = resolveInternalSessionKey({ key: sessionKey, alias, mainKey });
     taskLine = params.skipDefaultTaskLookup
       ? params.taskLineOverride
       : (params.taskLineOverride ?? formatSessionTaskLine(requesterKey));
-    if (!taskLine && !params.skipDefaultTaskLookup) {
-      taskLine = formatAgentTaskCountsLine(statusAgentId);
+    if (!params.skipDefaultTaskLookup) {
+      automationTaskLine = formatAutomationTaskCountsLine(statusAgentId);
+    }
+    if (!taskLine) {
+      taskLine = automationTaskLine;
+    } else if (automationTaskLine) {
+      taskLine = `${taskLine}\n${automationTaskLine}`;
     }
     const runs = listControlledSubagentRuns(requesterKey);
     const verboseEnabled = resolvedVerboseLevel && resolvedVerboseLevel !== "off";
