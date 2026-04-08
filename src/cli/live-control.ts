@@ -1252,12 +1252,14 @@ export async function collectLiveSyncStatus(params: SyncParams = {}): Promise<Li
   const deps = withDeps(params.deps);
   const status = await collectLiveStatus({ ...params, deps });
   const collector = createBlockerCollector();
+  const hasPromotedCommitDrift = status.issues.some(
+    (issue) => issue.code === "promoted-commit-drift",
+  );
 
   for (const issue of status.issues) {
     if (
       issue.code === "branch-drift" ||
       issue.code === "dirty-live-checkout" ||
-      issue.code === "promoted-commit-drift" ||
       issue.code === "runtime-source-mismatch"
     ) {
       collector.add({ code: issue.code, message: issue.message });
@@ -1358,6 +1360,25 @@ export async function collectLiveSyncStatus(params: SyncParams = {}): Promise<Li
     originMainSha && fetchOk && (counts.behind ?? 0) > 0
       ? await detectLockfileChange(status.manifest.liveCheckoutPath, "HEAD", "origin/main", deps)
       : false;
+
+  const promotedCommitDriftCanBeReconciled =
+    hasPromotedCommitDrift &&
+    status.runtime.matchesLiveCheckout === true &&
+    Boolean(originMainSha) &&
+    status.liveGit.head === originMainSha &&
+    (counts.ahead ?? 0) === 0 &&
+    (counts.behind ?? 0) === 0;
+
+  if (hasPromotedCommitDrift && !promotedCommitDriftCanBeReconciled) {
+    const issue = status.issues.find((entry) => entry.code === "promoted-commit-drift");
+    collector.add({
+      code: "promoted-commit-drift",
+      message:
+        issue?.message ??
+        `Live HEAD ${status.liveGit.head.slice(0, 7)} no longer matches promoted commit ${status.manifest.promotedCommit?.slice(0, 7) ?? "none"}.`,
+    });
+  }
+
   const blockers = collector.list();
 
   return {
@@ -1390,7 +1411,37 @@ export async function syncLiveCheckout(params: SyncParams = {}): Promise<{
     if (!statusBefore.originMainSha) {
       throw new Error("origin/main is unavailable for live sync.");
     }
+    const canReconcilePromotionOnly =
+      (statusBefore.behindBy ?? 0) === 0 &&
+      Boolean(manifest.promotedCommit) &&
+      manifest.promotedCommit !== statusBefore.liveSha &&
+      statusBefore.liveSha === statusBefore.originMainSha;
     if ((statusBefore.behindBy ?? 0) === 0) {
+      if (canReconcilePromotionOnly) {
+        const now = formatIso(deps.now());
+        await updateManifestPromotion(stateDir, manifest, {
+          currentCommit: statusBefore.liveSha,
+          previousCommit: manifest.promotedCommit ?? statusBefore.liveSha,
+          now,
+        });
+        await appendJournalEntry(stateDir, {
+          id: `sync-${Date.now()}`,
+          ts: now,
+          actor,
+          type: "synced",
+          message: `Reconciled live promotion metadata at ${statusBefore.liveSha.slice(0, 7)}`,
+          details: {
+            fromCommit: manifest.promotedCommit,
+            lockfileChanged: false,
+            metadataOnly: true,
+            toCommit: statusBefore.liveSha,
+          },
+        });
+        return {
+          applied: true,
+          status: await collectLiveSyncStatus({ ...params, deps, fetchOrigin: false }),
+        };
+      }
       return {
         applied: false,
         status: statusBefore,

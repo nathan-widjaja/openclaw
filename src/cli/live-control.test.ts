@@ -410,6 +410,33 @@ describe("live-control", () => {
     expect(status.blockers).toHaveLength(0);
   });
 
+  it("treats promoted commit drift as reconcilable when live main already matches origin/main", async () => {
+    const deps = createDeps();
+    await collectLiveStatus({ actor: "codex", checkout: repoDir, deps });
+
+    const manifestPath = path.join(stateDir, "live-control", "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+      promotedCommit: string | null;
+    };
+    manifest.promotedCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    const status = await collectLiveSyncStatus({
+      actor: "codex",
+      checkout: repoDir,
+      deps,
+    });
+
+    expect(status).toMatchObject({
+      behindBy: 0,
+      originMainSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      safeToApply: true,
+    });
+    expect(status.blockers).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "promoted-commit-drift" })]),
+    );
+  });
+
   it("reports a clean behind live lane and detects lockfile changes", async () => {
     const deps = createDeps({
       git: {
@@ -645,6 +672,50 @@ describe("live-control", () => {
     expect(journal.entries[0]).toMatchObject({
       actor: "codex",
       type: "synced",
+    });
+  });
+
+  it("reconciles promoted commit drift when live main already matches origin/main", async () => {
+    const buildCheckout = vi.fn<LiveControlDeps["buildCheckout"]>().mockResolvedValue(undefined);
+    const restartRuntime = vi.fn<LiveControlDeps["restartRuntime"]>().mockResolvedValue(undefined);
+    const deps = createDeps({
+      buildCheckout,
+      restartRuntime,
+    });
+
+    await collectLiveStatus({ actor: "codex", checkout: repoDir, deps });
+
+    const manifestPath = path.join(stateDir, "live-control", "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+      promotedCommit: string | null;
+    };
+    manifest.promotedCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    const result = await syncLiveCheckout({
+      actor: "codex",
+      checkout: repoDir,
+      deps,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.status.liveSha).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(result.status.behindBy).toBe(0);
+    expect(buildCheckout).not.toHaveBeenCalled();
+    expect(restartRuntime).not.toHaveBeenCalled();
+
+    const nextManifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+      promotedCommit: string;
+      previousPromotedCommit: string;
+    };
+    expect(nextManifest.promotedCommit).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(nextManifest.previousPromotedCommit).toBe("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    const journal = await listLiveJournal({ checkout: repoDir, deps, limit: 10 });
+    expect(journal.entries[0]).toMatchObject({
+      actor: "codex",
+      type: "synced",
+      message: "Reconciled live promotion metadata at aaaaaaa",
     });
   });
 
