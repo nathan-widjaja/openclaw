@@ -25,6 +25,8 @@ ATTACH_ONLY=1
 log()  { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+LAST_RUN_OUTPUT=""
+
 # Ensure local node binaries (rolldown, pnpm) are discoverable for the steps below.
 export PATH="${ROOT_DIR}/node_modules/.bin:${PATH}"
 
@@ -33,6 +35,19 @@ run_step() {
   log "==> ${label}"
   if ! "$@"; then
     fail "${label} failed"
+  fi
+}
+
+run_and_capture() {
+  local label="$1"; shift
+  log "==> ${label}"
+  LAST_RUN_OUTPUT=""
+  if ! LAST_RUN_OUTPUT="$("$@" 2>&1)"; then
+    printf '%s\n' "$LAST_RUN_OUTPUT"
+    return 1
+  fi
+  if [[ -n "$LAST_RUN_OUTPUT" ]]; then
+    printf '%s\n' "$LAST_RUN_OUTPUT"
   fi
 }
 
@@ -73,6 +88,21 @@ acquire_lock() {
 check_signing_keys() {
   security find-identity -p codesigning -v 2>/dev/null \
     | grep -Eq '(Developer ID Application|Apple Distribution|Apple Development)'
+}
+
+is_swift_toolchain_mismatch_output() {
+  printf '%s' "$1" | grep -qi "swift tools version" \
+    && printf '%s' "$1" | grep -qi "installed version is"
+}
+
+restart_gateway_daemon_fallback() {
+  local reason="$1"
+  log "WARNING: ${reason}"
+  log "==> Falling back to Gateway daemon restart from the current checkout"
+  if ! bash -lc "cd '${ROOT_DIR}' && node openclaw.mjs daemon restart"; then
+    fail "Gateway daemon restart fallback failed"
+  fi
+  log "==> Gateway daemon restart fallback completed"
 }
 
 trap cleanup EXIT INT TERM
@@ -158,7 +188,14 @@ run_step "bundle canvas a2ui" bash -lc "cd '${ROOT_DIR}' && pnpm canvas:a2ui:bun
 
 # 2) Rebuild into the same path the packager consumes (.build).
 run_step "clean build cache" bash -lc "cd '${ROOT_DIR}/apps/macos' && rm -rf .build .build-swift .swiftpm 2>/dev/null || true"
-run_step "swift build" bash -lc "cd '${ROOT_DIR}/apps/macos' && swift build -q --product OpenClaw"
+if ! run_and_capture "swift build" bash -lc "cd '${ROOT_DIR}/apps/macos' && swift build -q --product OpenClaw"; then
+  if [[ "$ATTACH_ONLY" -eq 1 ]] && is_swift_toolchain_mismatch_output "$LAST_RUN_OUTPUT"; then
+    restart_gateway_daemon_fallback \
+      "macOS app rebuild needs a newer Swift toolchain than this machine currently has."
+    exit 0
+  fi
+  fail "swift build failed"
+fi
 
 if [ "$AUTO_DETECT_SIGNING" -eq 1 ]; then
   if check_signing_keys; then
