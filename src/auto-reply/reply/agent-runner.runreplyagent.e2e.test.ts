@@ -1,10 +1,11 @@
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
 import * as sessions from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
+import { resetCommandQueueStateForTest } from "../../process/command-queue.js";
 import {
   createManagedTaskFlow,
   resetTaskFlowRegistryForTests,
@@ -121,6 +122,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  resetCommandQueueStateForTest();
   resetTaskFlowRegistryForTests();
   state.compactEmbeddedPiSessionMock.mockClear();
   state.isEmbeddedPiRunActiveMock.mockReset();
@@ -135,6 +137,11 @@ beforeEach(() => {
   vi.mocked(refreshQueuedFollowupSession).mockClear();
   vi.mocked(scheduleFollowupDrain).mockClear();
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
+});
+
+afterEach(() => {
+  resetCommandQueueStateForTest();
+  resetTaskFlowRegistryForTests();
 });
 
 function createMinimalRun(params?: {
@@ -174,6 +181,8 @@ function createMinimalRun(params?: {
       sessionId: "session",
       sessionKey,
       messageProvider: "whatsapp",
+      senderId: "test-sender",
+      ownerNumbers: ["test-sender"],
       sessionFile: "/tmp/session.jsonl",
       workspaceDir: "/tmp",
       config: {},

@@ -2,11 +2,16 @@ import { statSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withTempDir } from "../test-helpers/temp-dir.js";
 import {
+  acquireTaskFlowBrowserLease,
+  beginTaskFlowControllerAction,
   createManagedTaskFlow,
+  getTaskFlowBrowserLease,
+  getTaskFlowControllerAction,
   getTaskFlowById,
   requestFlowCancel,
   resetTaskFlowRegistryForTests,
   setFlowWaiting,
+  updateTaskFlowControllerAction,
 } from "./task-flow-registry.js";
 import {
   resolveTaskFlowRegistryDir,
@@ -64,6 +69,7 @@ describe("task-flow-registry store runtime", () => {
     const storedFlow = createStoredFlow();
     const loadSnapshot = vi.fn(() => ({
       flows: new Map([[storedFlow.flowId, storedFlow]]),
+      controllerActions: new Map(),
     }));
     const saveSnapshot = vi.fn();
     configureTaskFlowRegistryRuntime({
@@ -95,8 +101,10 @@ describe("task-flow-registry store runtime", () => {
     expect(saveSnapshot).toHaveBeenCalled();
     const latestSnapshot = saveSnapshot.mock.calls.at(-1)?.[0] as {
       flows: ReadonlyMap<string, TaskFlowRecord>;
+      controllerActions: ReadonlyMap<string, unknown>;
     };
     expect(latestSnapshot.flows.size).toBe(2);
+    expect(latestSnapshot.controllerActions.size).toBe(0);
     expect(latestSnapshot.flows.get("flow-restored")?.goal).toBe("Restored flow");
   });
 
@@ -167,6 +175,54 @@ describe("task-flow-registry store runtime", () => {
         flowId: created.flowId,
         stateJson: null,
         waitJson: null,
+      });
+    });
+  });
+
+  it("persists controller action records and the browser lease", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/controller-meta",
+        goal: "Persist controller metadata",
+        status: "running",
+      });
+      const started = beginTaskFlowControllerAction({
+        actionKey: '["agent:main:main","telegram:42","create"]',
+        ownerKey: "agent:main:main",
+        senderId: "telegram:owner",
+        updateId: "telegram:42",
+        normalizedAction: "create",
+        kind: "create",
+      });
+      updateTaskFlowControllerAction({
+        actionKey: started.record.actionKey,
+        expectedRevision: started.record.revision,
+        flowId: flow.flowId,
+        responseText: "Queued as flow controller42.",
+        status: "completed",
+      });
+      acquireTaskFlowBrowserLease({
+        ownerKey: "agent:main:main",
+        flowId: flow.flowId,
+        token: "lease-token-1",
+      });
+
+      resetTaskFlowRegistryForTests({ persist: false });
+
+      expect(getTaskFlowControllerAction(started.record.actionKey)).toMatchObject({
+        actionKey: started.record.actionKey,
+        flowId: flow.flowId,
+        status: "completed",
+        responseText: "Queued as flow controller42.",
+      });
+      expect(getTaskFlowBrowserLease()).toMatchObject({
+        ownerKey: "agent:main:main",
+        flowId: flow.flowId,
+        token: "lease-token-1",
       });
     });
   });

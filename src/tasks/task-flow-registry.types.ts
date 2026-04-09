@@ -21,6 +21,36 @@ export type TaskFlowStatus =
   | "cancelled"
   | "lost";
 
+export type TaskFlowControllerActionKind = "create" | "steer" | "cancel" | "retry";
+
+export type TaskFlowControllerActionStatus = "pending" | "completed";
+
+export type TaskFlowControllerActionRecord = {
+  actionKey: string;
+  ownerKey: string;
+  senderId?: string;
+  updateId: string;
+  normalizedAction: string;
+  kind: TaskFlowControllerActionKind;
+  revision: number;
+  status: TaskFlowControllerActionStatus;
+  flowId?: string;
+  responseText?: string;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+};
+
+export type TaskFlowBrowserLeaseRecord = {
+  ownerKey: string;
+  flowId: string;
+  token: string;
+  epoch: number;
+  acquiredAt: number;
+  heartbeatAt: number;
+  updatedAt: number;
+};
+
 export type TaskFlowRecord = {
   flowId: string;
   syncMode: TaskFlowSyncMode;

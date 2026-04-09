@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetCommandQueueStateForTest } from "../../process/command-queue.js";
 import {
   createManagedTaskFlow,
   resetTaskFlowRegistryForTests,
@@ -6,7 +7,7 @@ import {
 import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import type { TemplateContext } from "../templating.js";
 import { formatLiveTaskHandle, resolveLiveTaskBoard } from "./live-task-control.js";
-import { enqueueFollowupRun, type FollowupRun, type QueueSettings } from "./queue.js";
+import { enqueueFollowupRun, type QueueSettings } from "./queue.js";
 import { createMockFollowupRun, createMockTypingController } from "./test-helpers.js";
 
 const enqueueFollowupRunMock = vi.fn();
@@ -91,6 +92,7 @@ type RunWithModelFallbackParams = {
 
 describe("runReplyAgent live task controller", () => {
   beforeEach(() => {
+    resetCommandQueueStateForTest();
     resetTaskFlowRegistryForTests();
     resetTaskRegistryForTests();
     enqueueFollowupRunMock.mockReset();
@@ -111,6 +113,7 @@ describe("runReplyAgent live task controller", () => {
   });
 
   afterEach(() => {
+    resetCommandQueueStateForTest();
     resetTaskFlowRegistryForTests();
     resetTaskRegistryForTests();
     vi.useRealTimers();
@@ -134,6 +137,8 @@ describe("runReplyAgent live task controller", () => {
         sessionId: "session",
         sessionKey: "agent:main:main",
         messageProvider: "telegram",
+        senderId: "telegram:owner",
+        ownerNumbers: ["telegram:owner"],
         sessionFile: "/tmp/session.jsonl",
         workspaceDir: "/tmp",
         config: createCliBackendTestConfig(),

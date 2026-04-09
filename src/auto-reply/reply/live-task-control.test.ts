@@ -6,16 +6,22 @@ import {
 } from "../../tasks/task-flow-registry.js";
 import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import {
+  beginLiveTaskControllerAction,
   beginForegroundLiveTaskFlow,
+  buildForegroundLiveTaskAck,
+  buildLiveTaskBoardText,
   buildQueuedLiveTaskReply,
   buildBlockingLiveTaskReply,
+  buildLiveTaskStatusLine,
   cancelLiveTaskFlow,
   continueLiveTaskFlow,
   createQueuedLiveTaskFlow,
   formatLiveTaskHandle,
+  isAuthorizedLiveTaskOperator,
   isLiveTaskDirectMessage,
   queueLiveTaskFlowForRetry,
   resolveLiveTaskBoard,
+  setLiveTaskControllerActionReplyText,
   steerForegroundLiveTask,
 } from "./live-task-control.js";
 import { clearFollowupQueue, enqueueFollowupRun, listFollowupQueueItems } from "./queue.js";
@@ -39,6 +45,7 @@ function createSessionFollowup(prompt: string) {
   return createMockFollowupRun({
     prompt,
     summaryLine: prompt,
+    messageId: `telegram:${prompt}`,
     originatingChannel: "telegram",
     originatingChatType: "direct",
     run: {
@@ -105,6 +112,41 @@ describe("live task control", () => {
     expect(result.text).toContain(formatLiveTaskHandle(waiting));
   });
 
+  it("replays a pending controller action instead of creating duplicate side effects", () => {
+    const followup = createSessionFollowup("draft the next reply");
+    followup.messageId = "telegram:controller-action-1";
+
+    const started = beginLiveTaskControllerAction({
+      sessionKey: "agent:main:main",
+      followupRun: followup,
+      kind: "create",
+      normalizedAction: "create",
+    });
+    const replay = beginLiveTaskControllerAction({
+      sessionKey: "agent:main:main",
+      followupRun: followup,
+      kind: "create",
+      normalizedAction: "create",
+    });
+
+    expect(started?.replayText).toBeUndefined();
+    expect(replay?.replayText).toBe("Still processing your last control message.\nNext: /tasks");
+
+    setLiveTaskControllerActionReplyText({
+      actionKey: started?.actionKey,
+      text: "Flow controller42 is now running.\nNext: /tasks controller42",
+    });
+
+    const replayWithAck = beginLiveTaskControllerAction({
+      sessionKey: "agent:main:main",
+      followupRun: followup,
+      kind: "create",
+      normalizedAction: "create",
+    });
+
+    expect(replayWithAck?.replayText).toContain("Flow controller42 is now running.");
+  });
+
   it("only enables the live task controller for Telegram direct messages", () => {
     expect(
       isLiveTaskDirectMessage(
@@ -135,6 +177,49 @@ describe("live task control", () => {
         createMockFollowupRun({
           originatingChannel: "telegram",
           originatingChatType: "group",
+          run: {
+            sessionKey: "agent:main:main",
+            messageProvider: "telegram",
+          },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("only authorizes the configured Telegram operator", () => {
+    expect(
+      isAuthorizedLiveTaskOperator(
+        createMockFollowupRun({
+          originatingChannel: "telegram",
+          originatingChatType: "private",
+          run: {
+            sessionKey: "agent:main:main",
+            messageProvider: "telegram",
+            senderId: "telegram:owner",
+            ownerNumbers: ["telegram:owner"],
+          },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isAuthorizedLiveTaskOperator(
+        createMockFollowupRun({
+          originatingChannel: "telegram",
+          originatingChatType: "private",
+          run: {
+            sessionKey: "agent:main:main",
+            messageProvider: "telegram",
+            senderId: "telegram:stranger",
+            ownerNumbers: ["telegram:owner"],
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isAuthorizedLiveTaskOperator(
+        createMockFollowupRun({
+          originatingChannel: "telegram",
+          originatingChatType: "private",
           run: {
             sessionKey: "agent:main:main",
             messageProvider: "telegram",
@@ -242,6 +327,48 @@ describe("live task control", () => {
     expect(listFollowupQueueItems("agent:main:main")).toHaveLength(0);
   });
 
+  it("requires confirmation before cancelling an active browser-held flow", () => {
+    const running = beginForegroundLiveTaskFlow({
+      queueKey: "agent:main:main",
+      followupRun: createSessionFollowup("reply while the browser is warm"),
+    });
+
+    const reply = cancelLiveTaskFlow({
+      sessionKey: "agent:main:main",
+      flow: running,
+    });
+
+    expect(reply.text).toContain("actively holding the live browser");
+    expect(reply.text).toContain(`cancel ${formatLiveTaskHandle(running)} confirm`);
+    expect(abortEmbeddedPiRunMock).not.toHaveBeenCalled();
+  });
+
+  it("renders the controller status surfaces with health, handles, and legend", () => {
+    const running = beginForegroundLiveTaskFlow({
+      queueKey: "agent:main:main",
+      followupRun: createSessionFollowup("reply while the browser is warm"),
+    });
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "live-session-status-1",
+      resetTriggered: false,
+    });
+
+    const boardText = buildLiveTaskBoardText({
+      sessionKey: "agent:main:main",
+    });
+    const statusLine = buildLiveTaskStatusLine("agent:main:main");
+    const ack = buildForegroundLiveTaskAck(running);
+
+    expect(boardText).toContain("Controller: healthy");
+    expect(boardText).toContain("Legend: handles are short flow ids.");
+    expect(boardText).toContain(formatLiveTaskHandle(running));
+    expect(statusLine).toContain("controller healthy");
+    expect(statusLine).toContain(`foreground ${formatLiveTaskHandle(running)}`);
+    expect(ack.text).toContain(`Flow ${formatLiveTaskHandle(running)} is now running.`);
+    operation.complete();
+  });
+
   it("reports when a retry is deduped instead of claiming it was queued", () => {
     const waiting = createQueuedLiveTaskFlow({
       queueKey: "agent:main:main",
@@ -258,8 +385,8 @@ describe("live task control", () => {
     expect(result.text).toContain("Did not queue flow");
   });
 
-  it("moves a waiting flow into the foreground without losing the browser holder", () => {
-    const foreground = beginForegroundLiveTaskFlow({
+  it("moves a waiting flow into the foreground and clears a stale browser holder", () => {
+    beginForegroundLiveTaskFlow({
       queueKey: "agent:main:main",
       followupRun: createSessionFollowup("reply while the browser is warm"),
     });
@@ -287,7 +414,7 @@ describe("live task control", () => {
       `Flow ${formatLiveTaskHandle(waiting)} is now the foreground flow.`,
     );
     expect(board.foreground?.flowId).toBe(waiting.flowId);
-    expect(board.browserHolder?.flowId).toBe(foreground.flowId);
+    expect(board.browserHolder?.flowId).toBe(waiting.flowId);
   });
 
   it("reports foreground and next waiting flow in the blocker reply", () => {

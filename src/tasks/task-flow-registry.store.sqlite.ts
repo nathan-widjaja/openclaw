@@ -7,7 +7,13 @@ import {
   resolveTaskFlowRegistrySqlitePath,
 } from "./task-flow-registry.paths.js";
 import type { TaskFlowRegistryStoreSnapshot } from "./task-flow-registry.store.js";
-import type { TaskFlowRecord, TaskFlowSyncMode, JsonValue } from "./task-flow-registry.types.js";
+import type {
+  TaskFlowBrowserLeaseRecord,
+  TaskFlowControllerActionRecord,
+  TaskFlowRecord,
+  TaskFlowSyncMode,
+  JsonValue,
+} from "./task-flow-registry.types.js";
 
 type FlowRegistryRow = {
   flow_id: string;
@@ -31,11 +37,19 @@ type FlowRegistryRow = {
   ended_at: number | bigint | null;
 };
 
+type FlowRegistryMetaRow = {
+  meta_key: string;
+  meta_json: string;
+};
+
 type FlowRegistryStatements = {
   selectAll: StatementSync;
+  selectMetaAll: StatementSync;
   upsertRow: StatementSync;
+  upsertMetaRow: StatementSync;
   deleteRow: StatementSync;
   clearRows: StatementSync;
+  clearMetaRows: StatementSync;
 };
 
 type FlowRegistryDatabase = {
@@ -129,6 +143,13 @@ function bindFlowRecord(record: TaskFlowRecord) {
   };
 }
 
+function bindMetaRow(metaKey: string, value: unknown) {
+  return {
+    meta_key: metaKey,
+    meta_json: JSON.stringify(value),
+  };
+}
+
 function createStatements(db: DatabaseSync): FlowRegistryStatements {
   return {
     selectAll: db.prepare(`
@@ -154,6 +175,13 @@ function createStatements(db: DatabaseSync): FlowRegistryStatements {
         ended_at
       FROM flow_runs
       ORDER BY created_at ASC, flow_id ASC
+    `),
+    selectMetaAll: db.prepare(`
+      SELECT
+        meta_key,
+        meta_json
+      FROM flow_registry_meta
+      ORDER BY meta_key ASC
     `),
     upsertRow: db.prepare(`
       INSERT INTO flow_runs (
@@ -214,8 +242,20 @@ function createStatements(db: DatabaseSync): FlowRegistryStatements {
         updated_at = excluded.updated_at,
         ended_at = excluded.ended_at
     `),
+    upsertMetaRow: db.prepare(`
+      INSERT INTO flow_registry_meta (
+        meta_key,
+        meta_json
+      ) VALUES (
+        @meta_key,
+        @meta_json
+      )
+      ON CONFLICT(meta_key) DO UPDATE SET
+        meta_json = excluded.meta_json
+    `),
     deleteRow: db.prepare(`DELETE FROM flow_runs WHERE flow_id = ?`),
     clearRows: db.prepare(`DELETE FROM flow_runs`),
+    clearMetaRows: db.prepare(`DELETE FROM flow_registry_meta`),
   };
 }
 
@@ -246,6 +286,12 @@ function ensureSchema(db: DatabaseSync) {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       ended_at INTEGER
+    );
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS flow_registry_meta (
+      meta_key TEXT PRIMARY KEY,
+      meta_json TEXT NOT NULL
     );
   `);
   if (!hasFlowRunsColumn(db, "owner_key") && hasFlowRunsColumn(db, "owner_session_key")) {
@@ -315,6 +361,39 @@ function ensureSchema(db: DatabaseSync) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_flow_runs_updated_at ON flow_runs(updated_at);`);
 }
 
+function parseBrowserLeaseRecord(raw: string): TaskFlowBrowserLeaseRecord | undefined {
+  return parseJsonValue<TaskFlowBrowserLeaseRecord>(raw);
+}
+
+function parseControllerActionRecord(raw: string): TaskFlowControllerActionRecord | undefined {
+  return parseJsonValue<TaskFlowControllerActionRecord>(raw);
+}
+
+function applyMetaSnapshot(
+  rows: FlowRegistryMetaRow[],
+): Pick<TaskFlowRegistryStoreSnapshot, "browserLease" | "controllerActions"> {
+  const controllerActions = new Map<string, TaskFlowControllerActionRecord>();
+  let browserLease: TaskFlowBrowserLeaseRecord | undefined;
+  for (const row of rows) {
+    if (row.meta_key === "browser_lease") {
+      browserLease = parseBrowserLeaseRecord(row.meta_json);
+      continue;
+    }
+    if (!row.meta_key.startsWith("controller_action:")) {
+      continue;
+    }
+    const record = parseControllerActionRecord(row.meta_json);
+    if (!record) {
+      continue;
+    }
+    controllerActions.set(record.actionKey, record);
+  }
+  return {
+    controllerActions,
+    ...(browserLease ? { browserLease } : {}),
+  };
+}
+
 function ensureFlowRegistryPermissions(pathname: string) {
   const dir = resolveTaskFlowRegistryDir(process.env);
   mkdirSync(dir, { recursive: true, mode: FLOW_REGISTRY_DIR_MODE });
@@ -369,16 +448,27 @@ function withWriteTransaction(write: (statements: FlowRegistryStatements) => voi
 export function loadTaskFlowRegistryStateFromSqlite(): TaskFlowRegistryStoreSnapshot {
   const { statements } = openFlowRegistryDatabase();
   const rows = statements.selectAll.all() as FlowRegistryRow[];
+  const metaRows = statements.selectMetaAll.all() as FlowRegistryMetaRow[];
+  const metaSnapshot = applyMetaSnapshot(metaRows);
   return {
     flows: new Map(rows.map((row) => [row.flow_id, rowToFlowRecord(row)])),
+    controllerActions: metaSnapshot.controllerActions,
+    browserLease: metaSnapshot.browserLease,
   };
 }
 
 export function saveTaskFlowRegistryStateToSqlite(snapshot: TaskFlowRegistryStoreSnapshot) {
   withWriteTransaction((statements) => {
     statements.clearRows.run();
+    statements.clearMetaRows.run();
     for (const flow of snapshot.flows.values()) {
       statements.upsertRow.run(bindFlowRecord(flow));
+    }
+    if (snapshot.browserLease) {
+      statements.upsertMetaRow.run(bindMetaRow("browser_lease", snapshot.browserLease));
+    }
+    for (const action of snapshot.controllerActions.values()) {
+      statements.upsertMetaRow.run(bindMetaRow(`controller_action:${action.actionKey}`, action));
     }
   });
 }
