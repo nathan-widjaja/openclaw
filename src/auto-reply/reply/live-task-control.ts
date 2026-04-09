@@ -51,6 +51,7 @@ type RequestState = {
 
 type RuntimeState = {
   inlineActive?: boolean;
+  backgroundActive?: boolean;
 };
 
 type LiveTaskFlowState = {
@@ -140,6 +141,7 @@ function normalizeControllerStateJson(stateJson: JsonValue | undefined): LiveTas
       ? {
           runtime: {
             inlineActive: runtimeRoot.inlineActive === true,
+            backgroundActive: runtimeRoot.backgroundActive === true,
           },
         }
       : {}),
@@ -174,8 +176,12 @@ function buildStateJson(params: {
   const runtimeCurrent = current.runtime ?? {};
   const runtime: RuntimeState = {
     inlineActive: params.runtime?.inlineActive ?? runtimeCurrent.inlineActive ?? false,
+    backgroundActive: params.runtime?.backgroundActive ?? runtimeCurrent.backgroundActive ?? false,
   };
-  const runtimeJson = runtime.inlineActive ? { inlineActive: true } : {};
+  const runtimeJson = {
+    ...(runtime.inlineActive ? { inlineActive: true } : {}),
+    ...(runtime.backgroundActive ? { backgroundActive: true } : {}),
+  };
   return {
     controller: {
       foreground: controller.foreground === true,
@@ -227,10 +233,14 @@ function clearManagedFlowMarkers(params: {
     const nextForeground = params.clearForeground ? false : state.controller.foreground;
     const nextBrowserLease = params.clearBrowserLease ? false : state.controller.browserLease;
     const nextInlineRuntime = params.clearInlineRuntime ? false : state.runtime?.inlineActive;
+    const nextBackgroundRuntime = params.clearInlineRuntime
+      ? false
+      : state.runtime?.backgroundActive;
     if (
       nextForeground === state.controller.foreground &&
       nextBrowserLease === state.controller.browserLease &&
-      nextInlineRuntime === state.runtime?.inlineActive
+      nextInlineRuntime === state.runtime?.inlineActive &&
+      nextBackgroundRuntime === state.runtime?.backgroundActive
     ) {
       continue;
     }
@@ -244,6 +254,7 @@ function clearManagedFlowMarkers(params: {
         },
         runtime: {
           inlineActive: nextInlineRuntime,
+          backgroundActive: nextBackgroundRuntime,
         },
       }),
     }));
@@ -420,6 +431,7 @@ function markFlowLost(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
         },
         runtime: {
           inlineActive: false,
+          backgroundActive: false,
         },
       }),
     })) ?? flow;
@@ -443,6 +455,7 @@ function reconcileFlow(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
   const state = normalizeControllerStateJson(flow.stateJson);
   const activeReplyRun = replyRunRegistry.isActive(flow.ownerKey);
   const hasInlineRuntime = state.runtime?.inlineActive === true && activeReplyRun;
+  const hasBackgroundRuntime = state.runtime?.backgroundActive === true && activeReplyRun;
   const hasLegacyInlineRuntime =
     flow.status === "running" &&
     activeReplyRun &&
@@ -452,7 +465,13 @@ function reconcileFlow(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
   const lease = getTaskFlowBrowserLease();
   const leaseHeldByFlow =
     lease?.flowId === flow.flowId && lease.ownerKey === flow.ownerKey ? lease : undefined;
-  if (!hasInlineRuntime && !hasLegacyInlineRuntime && !hasLinkedTasks && !queued) {
+  if (
+    !hasInlineRuntime &&
+    !hasBackgroundRuntime &&
+    !hasLegacyInlineRuntime &&
+    !hasLinkedTasks &&
+    !queued
+  ) {
     if (leaseHeldByFlow || state.controller.browserLease || state.controller.foreground) {
       return markFlowLost(flow, now);
     }
@@ -754,6 +773,7 @@ export function createQueuedLiveTaskFlow(params: {
             },
             runtime: {
               inlineActive: false,
+              backgroundActive: false,
             },
             request: {
               prompt: params.followupRun.prompt,
@@ -836,6 +856,7 @@ export function beginForegroundLiveTaskFlow(params: {
             },
             runtime: {
               inlineActive: true,
+              backgroundActive: false,
             },
             request: {
               prompt: params.followupRun.prompt,
@@ -860,6 +881,7 @@ export function beginForegroundLiveTaskFlow(params: {
             },
             runtime: {
               inlineActive: true,
+              backgroundActive: false,
             },
             request: {
               prompt: params.followupRun.prompt,
@@ -883,6 +905,7 @@ export function beginForegroundLiveTaskFlow(params: {
         },
         runtime: {
           inlineActive: true,
+          backgroundActive: false,
         },
         request: {
           prompt: params.followupRun.prompt,
@@ -911,6 +934,7 @@ export function beginForegroundLiveTaskFlow(params: {
             },
             runtime: {
               inlineActive: true,
+              backgroundActive: false,
             },
           }),
         })) ?? flow;
@@ -988,6 +1012,37 @@ export function settleLiveTaskFlow(params: {
       },
       runtime: {
         inlineActive: false,
+        backgroundActive: false,
+      },
+    }),
+  }));
+}
+
+export function beginBackgroundLiveTaskFlow(params: {
+  flowId?: string;
+  currentStep?: string;
+}): TaskFlowRecord | undefined {
+  const flowId = params.flowId?.trim();
+  if (!flowId) {
+    return undefined;
+  }
+  return updateManagedFlow(flowId, (current) => ({
+    status: "running",
+    currentStep: params.currentStep ?? "Working in the background.",
+    blockedTaskId: null,
+    blockedSummary: null,
+    waitJson: null,
+    endedAt: null,
+    stateJson: buildStateJson({
+      flow: current,
+      controller: {
+        foreground: false,
+        browserLease: false,
+        leaseToken: undefined,
+      },
+      runtime: {
+        inlineActive: false,
+        backgroundActive: true,
       },
     }),
   }));
@@ -1007,6 +1062,17 @@ export function buildQueuedLiveTaskReply(params: { queueKey: string; flow: TaskF
     `Next: ${formatLiveTaskNextPhrases(params.flow).join(" · ")}`,
   ];
   return { text: lines.join("\n") };
+}
+
+export function buildBackgroundLiveTaskAck(flow: TaskFlowRecord): { text: string } {
+  const handle = formatLiveTaskHandle(flow);
+  const goal = sanitizeFlowText(flow.goal, 120) || "this task";
+  return {
+    text: [
+      `Working on ${goal} in the background as ${handle}.`,
+      `Next: /tasks ${handle} · cancel ${handle}`,
+    ].join("\n"),
+  };
 }
 
 export function buildForegroundLiveTaskAck(flow: TaskFlowRecord): { text: string } {
@@ -1479,6 +1545,7 @@ export function queueLiveTaskFlowForRetry(params: {
       },
       runtime: {
         inlineActive: false,
+        backgroundActive: false,
       },
     }),
   }));

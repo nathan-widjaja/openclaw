@@ -7,10 +7,11 @@ import {
 import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import {
   beginLiveTaskControllerAction,
+  beginBackgroundLiveTaskFlow,
+  buildBackgroundLiveTaskAck,
   beginForegroundLiveTaskFlow,
   buildForegroundLiveTaskAck,
   buildLiveTaskBoardText,
-  buildQueuedLiveTaskReply,
   buildBlockingLiveTaskReply,
   buildLiveTaskStatusLine,
   cancelLiveTaskFlow,
@@ -269,6 +270,28 @@ describe("live task control", () => {
     operation.complete();
   });
 
+  it("keeps a background-running flow alive while its reply operation is still active", () => {
+    const waiting = createQueuedLiveTaskFlow({
+      queueKey: "agent:main:main",
+      followupRun: createSessionFollowup("draft the founder reply"),
+    });
+    const running = beginBackgroundLiveTaskFlow({
+      flowId: waiting.flowId,
+    });
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "live-session-2",
+      resetTriggered: false,
+    });
+
+    const board = resolveLiveTaskBoard("agent:main:main");
+    const reconciled = board.all.find((flow) => flow.flowId === running?.flowId);
+
+    expect(reconciled?.status).toBe("running");
+    expect(reconciled?.currentStep).toBe("Working in the background.");
+    operation.complete();
+  });
+
   it("keeps a running flow alive when a linked subagent task is still active", () => {
     const flow = createManagedTaskFlow({
       ownerKey: "agent:main:main",
@@ -485,24 +508,18 @@ describe("live task control", () => {
     expect(reply?.text).not.toContain(`Next waiting flow: ${formatLiveTaskHandle(secondWaiting)}.`);
   });
 
-  it("formats the immediate queued reply with the foreground holder and next phrases", () => {
-    const foreground = beginForegroundLiveTaskFlow({
-      queueKey: "agent:main:main",
-      followupRun: createSessionFollowup("reply while the browser is warm"),
-    });
+  it("formats the immediate background ack without queue wording", () => {
     const waiting = createQueuedLiveTaskFlow({
       queueKey: "agent:main:main",
       followupRun: createSessionFollowup("draft the next batch"),
     });
 
-    const reply = buildQueuedLiveTaskReply({
-      queueKey: "agent:main:main",
-      flow: waiting,
-    });
+    const reply = buildBackgroundLiveTaskAck(waiting);
 
-    expect(reply.text).toContain(`Foreground flow ${formatLiveTaskHandle(foreground)}`);
-    expect(reply.text).toContain(`Queued as flow ${formatLiveTaskHandle(waiting)}`);
-    expect(reply.text).toContain("Next:");
+    expect(reply.text).toContain(`background as ${formatLiveTaskHandle(waiting)}`);
+    expect(reply.text).toContain(`cancel ${formatLiveTaskHandle(waiting)}`);
+    expect(reply.text).not.toContain("Queued as flow");
+    expect(reply.text).not.toContain("foreground capacity");
   });
 
   it("steers the foreground flow while the browser is warm", () => {

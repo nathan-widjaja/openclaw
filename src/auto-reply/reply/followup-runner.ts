@@ -21,6 +21,7 @@ import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { runPreflightCompactionIfNeeded } from "./agent-runner-memory.js";
 import { resolveRunAuthProfile } from "./agent-runner-utils.js";
+import { beginBackgroundLiveTaskFlow, settleLiveTaskFlow } from "./live-task-control.js";
 import {
   resolveOriginAccountId,
   resolveOriginMessageProvider,
@@ -157,6 +158,7 @@ export function createFollowupRunner(params: {
 
   return async (queued: FollowupRun) => {
     const replySessionKey = queued.run.sessionKey ?? sessionKey;
+    const controllerFlowId = queued.controllerFlowId?.trim() || queued.controller?.flowId?.trim();
     const replyOperation = createReplyOperation({
       sessionId: queued.run.sessionId,
       sessionKey: replySessionKey ?? "",
@@ -164,6 +166,11 @@ export function createFollowupRunner(params: {
       upstreamAbortSignal: opts?.abortSignal,
     });
     try {
+      if (controllerFlowId) {
+        beginBackgroundLiveTaskFlow({
+          flowId: controllerFlowId,
+        });
+      }
       const runId = crypto.randomUUID();
       const shouldSurfaceToControlUi = isInternalMessageChannel(
         resolveOriginMessageProvider({
@@ -301,6 +308,13 @@ export function createFollowupRunner(params: {
         const message = err instanceof Error ? err.message : String(err);
         replyOperation.fail("run_failed", err);
         defaultRuntime.error?.(`Followup agent failed before reply: ${message}`);
+        if (controllerFlowId) {
+          settleLiveTaskFlow({
+            flowId: controllerFlowId,
+            status: "failed",
+            blockedSummary: message,
+          });
+        }
         return;
       }
 
@@ -344,6 +358,12 @@ export function createFollowupRunner(params: {
         : undefined;
       const payloadArray = runResult.payloads ?? [];
       if (payloadArray.length === 0) {
+        if (controllerFlowId) {
+          settleLiveTaskFlow({
+            flowId: controllerFlowId,
+            status: "succeeded",
+          });
+        }
         return;
       }
       const sanitizedPayloads = payloadArray.flatMap((payload) => {
@@ -400,6 +420,12 @@ export function createFollowupRunner(params: {
       const finalPayloads = suppressMessagingToolReplies ? [] : mediaFilteredPayloads;
 
       if (finalPayloads.length === 0) {
+        if (controllerFlowId) {
+          settleLiveTaskFlow({
+            flowId: controllerFlowId,
+            status: "succeeded",
+          });
+        }
         return;
       }
       if (startNotice) {
@@ -440,6 +466,12 @@ export function createFollowupRunner(params: {
       }
 
       await sendFollowupPayloads(finalPayloads, queued);
+      if (controllerFlowId) {
+        settleLiveTaskFlow({
+          flowId: controllerFlowId,
+          status: "succeeded",
+        });
+      }
     } finally {
       replyOperation.complete();
       // Both signals are required for the typing controller to clean up.

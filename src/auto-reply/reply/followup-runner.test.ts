@@ -21,6 +21,9 @@ let resetQueuedFollowupLifecycleForTests: typeof import("./queue-lifecycle.js").
 let sessionRunAccounting: typeof import("./session-run-accounting.js");
 let createMockFollowupRun: typeof import("./test-helpers.js").createMockFollowupRun;
 let createMockTypingController: typeof import("./test-helpers.js").createMockTypingController;
+let createQueuedLiveTaskFlow: typeof import("./live-task-control.js").createQueuedLiveTaskFlow;
+let resolveLiveTaskFlow: typeof import("./live-task-control.js").resolveLiveTaskFlow;
+let resetTaskFlowRegistryForTests: typeof import("../../tasks/task-flow-registry.js").resetTaskFlowRegistryForTests;
 const FOLLOWUP_DEBUG = process.env.OPENCLAW_DEBUG_FOLLOWUP_RUNNER_TEST === "1";
 const FOLLOWUP_TEST_QUEUES = new Map<
   string,
@@ -272,6 +275,8 @@ async function loadFreshFollowupRunnerModuleForTest() {
   } = await import("./queue-lifecycle.js"));
   sessionRunAccounting = await import("./session-run-accounting.js");
   ({ createMockFollowupRun, createMockTypingController } = await import("./test-helpers.js"));
+  ({ createQueuedLiveTaskFlow, resolveLiveTaskFlow } = await import("./live-task-control.js"));
+  ({ resetTaskFlowRegistryForTests } = await import("../../tasks/task-flow-registry.js"));
 }
 
 const ROUTABLE_TEST_CHANNELS = new Set([
@@ -297,12 +302,14 @@ beforeEach(async () => {
   clearFollowupQueue("main");
   FOLLOWUP_TEST_QUEUES.clear();
   resetQueuedFollowupLifecycleForTests();
+  resetTaskFlowRegistryForTests();
 });
 
 afterEach(async () => {
   clearFollowupQueue("main");
   FOLLOWUP_TEST_QUEUES.clear();
   resetQueuedFollowupLifecycleForTests();
+  resetTaskFlowRegistryForTests();
   vi.clearAllTimers();
   vi.useRealTimers();
   const { clearSessionStoreCacheForTest } = await import("../../config/sessions/store.js");
@@ -1301,6 +1308,107 @@ describe("createFollowupRunner typing cleanup", () => {
 
     expect(onBlockReply).toHaveBeenCalled();
     expectTypingCleanup(typing);
+  });
+});
+
+describe("createFollowupRunner live task lifecycle", () => {
+  it("settles controller-managed queued flows after background work completes", async () => {
+    const queued = createQueuedLiveTaskFlow({
+      queueKey: "agent:main:main",
+      followupRun: createQueuedRun({
+        prompt: "draft the founder reply",
+        summaryLine: "draft the founder reply",
+        originatingChannel: "telegram",
+        originatingChatType: "direct",
+        run: {
+          sessionKey: "agent:main:main",
+          messageProvider: "telegram",
+        },
+      }),
+    });
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "done" }],
+      meta: {},
+    });
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply: vi.fn(async () => {}) },
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-6",
+    });
+
+    const controllerRun = createQueuedRun({
+      prompt: "draft the founder reply",
+      summaryLine: "draft the founder reply",
+      messageId: "telegram:controller-run",
+      originatingChannel: "telegram",
+      originatingChatType: "direct",
+      run: {
+        sessionKey: "agent:main:main",
+        messageProvider: "telegram",
+      },
+    });
+    controllerRun.controllerFlowId = queued.flowId;
+    controllerRun.controller = {
+      flowId: queued.flowId,
+      waitKind: "capacity",
+      skipQueuedLifecycle: true,
+    };
+
+    await runner(controllerRun);
+
+    const settled = resolveLiveTaskFlow("agent:main:main", queued.flowId);
+    expect(settled?.status).toBe("succeeded");
+    expect(settled?.waitJson).toBeNull();
+  });
+
+  it("marks controller-managed queued flows failed when the background run errors", async () => {
+    const queued = createQueuedLiveTaskFlow({
+      queueKey: "agent:main:main",
+      followupRun: createQueuedRun({
+        prompt: "draft the founder reply",
+        summaryLine: "draft the founder reply",
+        originatingChannel: "telegram",
+        originatingChatType: "direct",
+        run: {
+          sessionKey: "agent:main:main",
+          messageProvider: "telegram",
+        },
+      }),
+    });
+    runEmbeddedPiAgentMock.mockRejectedValueOnce(new Error("agent exploded"));
+
+    const runner = createFollowupRunner({
+      opts: { onBlockReply: vi.fn(async () => {}) },
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-6",
+    });
+
+    const controllerRun = createQueuedRun({
+      prompt: "draft the founder reply",
+      summaryLine: "draft the founder reply",
+      messageId: "telegram:controller-run-error",
+      originatingChannel: "telegram",
+      originatingChatType: "direct",
+      run: {
+        sessionKey: "agent:main:main",
+        messageProvider: "telegram",
+      },
+    });
+    controllerRun.controllerFlowId = queued.flowId;
+    controllerRun.controller = {
+      flowId: queued.flowId,
+      waitKind: "capacity",
+      skipQueuedLifecycle: true,
+    };
+
+    await runner(controllerRun);
+
+    const settled = resolveLiveTaskFlow("agent:main:main", queued.flowId);
+    expect(settled?.status).toBe("failed");
+    expect(settled?.blockedSummary).toContain("agent exploded");
   });
 });
 

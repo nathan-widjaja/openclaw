@@ -422,7 +422,7 @@ describe("runReplyAgent heartbeat followup guard", () => {
 });
 
 describe("runReplyAgent live task controller", () => {
-  it("returns a managed flow ack for a second Telegram DM and bypasses queued lifecycle notices", async () => {
+  it("returns an immediate background ack for a second Telegram DM and bypasses queued lifecycle notices", async () => {
     const { run } = createMinimalRun({
       isActive: true,
       shouldFollowup: true,
@@ -438,13 +438,39 @@ describe("runReplyAgent live task controller", () => {
     const result = await run();
 
     expect(result).toMatchObject({
-      text: expect.stringContaining("Queued as flow"),
+      text: expect.stringContaining("in the background as"),
     });
     expect((result as { text?: string } | undefined)?.text).not.toContain(
       "Queued behind earlier work",
     );
+    expect((result as { text?: string } | undefined)?.text).not.toContain(
+      "Another foreground flow is still active.",
+    );
     expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);
     expect(state.registerQueuedFollowupLifecycleMock).not.toHaveBeenCalled();
+  });
+
+  it("background-dispatches a Telegram DM even when the lane is idle", async () => {
+    const { run } = createMinimalRun({
+      isActive: false,
+      shouldFollowup: false,
+      resolvedQueueMode: "collect",
+      sessionKey: "agent:main:main",
+      queueKey: "agent:main:main",
+      followupOverrides: createTelegramDirectFollowup("Draft the next replies now"),
+      runOverrides: {
+        messageProvider: "telegram",
+      },
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("in the background as"),
+    });
+    expect((result as { text?: string } | undefined)?.text).not.toContain("is now running");
+    expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);
+    expect(state.runEmbeddedPiAgentMock).not.toHaveBeenCalled();
   });
 
   it("answers blocking questions immediately for an active Telegram DM", async () => {

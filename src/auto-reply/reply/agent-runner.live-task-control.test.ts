@@ -123,6 +123,7 @@ describe("runReplyAgent live task controller", () => {
     commandBody: string;
     isActive?: boolean;
     shouldFollowup?: boolean;
+    isRunActive?: () => boolean;
     queueMode?: QueueSettings["mode"];
   }) {
     const typing = createMockTypingController();
@@ -166,6 +167,7 @@ describe("runReplyAgent live task controller", () => {
           shouldSteer: false,
           shouldFollowup: params.shouldFollowup ?? true,
           isActive: params.isActive ?? false,
+          isRunActive: params.isRunActive,
           isStreaming: false,
           typing,
           sessionCtx,
@@ -246,5 +248,25 @@ describe("runReplyAgent live task controller", () => {
       text: expect.stringContaining("Did not queue flow"),
     });
     expect((result as { text?: string } | undefined)?.text).not.toContain("Queued as flow");
+  });
+
+  it("dispatches Telegram DM work to the background even when no run is active", async () => {
+    const { run } = createLiveTaskControllerRun({
+      commandBody: "draft the next replies now",
+      isActive: false,
+      shouldFollowup: false,
+      isRunActive: () => true,
+      queueMode: "collect",
+    });
+
+    const result = await run();
+    const board = resolveLiveTaskBoard("agent:main:main");
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("in the background as"),
+    });
+    expect((result as { text?: string } | undefined)?.text).not.toContain("is now running");
+    expect(board.foreground).toBeUndefined();
+    expect(enqueueFollowupRunMock).toHaveBeenCalledTimes(1);
   });
 });

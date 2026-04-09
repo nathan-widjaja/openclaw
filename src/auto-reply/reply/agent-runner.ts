@@ -55,6 +55,7 @@ import { createAudioAsVoiceBuffer, createBlockReplyPipeline } from "./block-repl
 import { resolveEffectiveBlockStreamingConfig } from "./block-streaming.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import {
+  buildBackgroundLiveTaskAck,
   beginLiveTaskControllerAction,
   buildForegroundLiveTaskAck,
   buildLiveTaskDisambiguationReply,
@@ -62,7 +63,6 @@ import {
   beginForegroundLiveTaskFlow,
   buildBlockingLiveTaskReply,
   buildDidNotQueueLiveTaskReply,
-  buildQueuedLiveTaskReply,
   cancelLiveTaskFlow,
   completeLiveTaskControllerAction,
   continueLiveTaskFlow,
@@ -291,12 +291,15 @@ export async function runReplyAgent(params: {
     }
   }
 
-  const activeRunQueueAction = resolveActiveRunQueueAction({
-    isActive,
-    isHeartbeat,
-    shouldFollowup,
-    queueMode: resolvedQueue.mode,
-  });
+  const activeRunQueueAction =
+    liveTaskDm && !isHeartbeat
+      ? "enqueue-followup"
+      : resolveActiveRunQueueAction({
+          isActive,
+          isHeartbeat,
+          shouldFollowup,
+          queueMode: resolvedQueue.mode,
+        });
 
   const queuedRunFollowupTurn = createFollowupRunner({
     opts,
@@ -533,10 +536,7 @@ export async function runReplyAgent(params: {
         });
         return reply;
       }
-      const reply = buildQueuedLiveTaskReply({
-        queueKey,
-        flow: liveTaskFlow,
-      });
+      const reply = buildBackgroundLiveTaskAck(liveTaskFlow);
       completeLiveTaskControllerAction({
         actionKey: liveTaskActionKey,
         flowId: liveTaskFlow.flowId,
@@ -568,12 +568,13 @@ export async function runReplyAgent(params: {
     throw error;
   }
   let runFollowupTurn = queuedRunFollowupTurn;
-  const liveTaskFlow = liveTaskDm
-    ? beginForegroundLiveTaskFlow({
-        queueKey,
-        followupRun,
-      })
-    : undefined;
+  const liveTaskFlow =
+    liveTaskDm && activeRunQueueAction === "run-now"
+      ? beginForegroundLiveTaskFlow({
+          queueKey,
+          followupRun,
+        })
+      : undefined;
   if (liveTaskFlow) {
     setLiveTaskControllerActionFlowId({
       actionKey: liveTaskActionKey,
