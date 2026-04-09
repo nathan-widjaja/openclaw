@@ -779,6 +779,7 @@ export function acquireTaskFlowBrowserLease(params: {
     } {
   ensureFlowRegistryReady();
   const now = params.heartbeatAt ?? Date.now();
+  const priorEpoch = browserLease?.epoch ?? 0;
   if (browserLease && browserLease.flowId !== params.flowId) {
     return {
       applied: false,
@@ -796,7 +797,7 @@ export function acquireTaskFlowBrowserLease(params: {
         ownerKey: assertFlowOwnerKey(params.ownerKey),
         flowId: params.flowId,
         token: params.token?.trim() || crypto.randomUUID(),
-        epoch: (browserLease?.epoch ?? 0) + 1,
+        epoch: priorEpoch + 1,
         acquiredAt: now,
         heartbeatAt: now,
         updatedAt: now,
