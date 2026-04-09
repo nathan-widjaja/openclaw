@@ -1,5 +1,7 @@
 import { abortEmbeddedPiRun, resolveActiveEmbeddedRunSessionId } from "../../agents/pi-embedded.js";
 import { formatTimeAgo } from "../../infra/format-time/format-relative.ts";
+import { getQueueSize } from "../../process/command-queue.js";
+import { CommandLane } from "../../process/lanes.js";
 import { listTasksForFlowId } from "../../tasks/runtime-internal.js";
 import {
   getTaskFlowByIdForOwner,
@@ -7,11 +9,23 @@ import {
   resolveTaskFlowForLookupTokenForOwner,
 } from "../../tasks/task-flow-owner-access.js";
 import {
+  acquireTaskFlowBrowserLease,
+  beginTaskFlowControllerAction,
+  clearTaskFlowBrowserLease,
   createManagedTaskFlow,
+  getTaskFlowBrowserLease,
+  getTaskFlowControllerAction,
   getTaskFlowById,
+  releaseTaskFlowBrowserLease,
+  updateTaskFlowControllerAction,
   updateFlowRecordByIdExpectedRevision,
 } from "../../tasks/task-flow-registry.js";
-import type { JsonValue, TaskFlowRecord } from "../../tasks/task-flow-registry.types.js";
+import type {
+  JsonValue,
+  TaskFlowControllerActionRecord,
+  TaskFlowControllerActionKind,
+  TaskFlowRecord,
+} from "../../tasks/task-flow-registry.types.js";
 import { sanitizeTaskStatusText } from "../../tasks/task-status.js";
 import { listFollowupQueueItems, removeFollowupQueueItems, type FollowupRun } from "./queue.js";
 import { replyRunRegistry } from "./reply-run-registry.js";
@@ -26,6 +40,7 @@ type LiveTaskWaitKind = "capacity" | "browser_lease";
 type ControllerState = {
   foreground?: boolean;
   browserLease?: boolean;
+  leaseToken?: string;
 };
 
 type RequestState = {
@@ -58,6 +73,7 @@ export type LiveTaskBoard = {
   blocked: TaskFlowRecord[];
   waiting: TaskFlowRecord[];
   recent: TaskFlowRecord[];
+  controllerHealth: string;
 };
 
 function sanitizeFlowText(value: unknown, maxChars?: number): string {
@@ -97,6 +113,10 @@ function normalizeControllerStateJson(stateJson: JsonValue | undefined): LiveTas
     controller: {
       foreground: controllerRoot.foreground === true,
       browserLease: controllerRoot.browserLease === true,
+      leaseToken:
+        typeof controllerRoot.leaseToken === "string" && controllerRoot.leaseToken.trim()
+          ? controllerRoot.leaseToken
+          : undefined,
     },
     ...(requestRoot
       ? {
@@ -138,6 +158,7 @@ function buildStateJson(params: {
   const controller: ControllerState = {
     foreground: params.controller?.foreground ?? current.controller.foreground ?? false,
     browserLease: params.controller?.browserLease ?? current.controller.browserLease ?? false,
+    leaseToken: params.controller?.leaseToken ?? current.controller.leaseToken,
   };
   const requestCurrent = current.request ?? {};
   const request: RequestState = {
@@ -156,7 +177,11 @@ function buildStateJson(params: {
   };
   const runtimeJson = runtime.inlineActive ? { inlineActive: true } : {};
   return {
-    controller,
+    controller: {
+      foreground: controller.foreground === true,
+      browserLease: controller.browserLease === true,
+      ...(controller.leaseToken ? { leaseToken: controller.leaseToken } : {}),
+    },
     ...(Object.keys(requestJson).length > 0 ? { request: requestJson } : {}),
     ...(Object.keys(runtimeJson).length > 0 ? { runtime: runtimeJson } : {}),
   };
@@ -215,6 +240,7 @@ function clearManagedFlowMarkers(params: {
         controller: {
           foreground: nextForeground,
           browserLease: nextBrowserLease,
+          leaseToken: nextBrowserLease ? state.controller.leaseToken : undefined,
         },
         runtime: {
           inlineActive: nextInlineRuntime,
@@ -272,6 +298,71 @@ function waitKindFromText(text: string): LiveTaskWaitKind {
   return /\b(browser|warm|tab|page|site|click|reply)\b/i.test(text) ? "browser_lease" : "capacity";
 }
 
+export function isAuthorizedLiveTaskOperator(run: FollowupRun): boolean {
+  if (run.run.senderIsOwner === true) {
+    return true;
+  }
+  const senderId = run.run.senderId?.trim();
+  if (!senderId) {
+    return false;
+  }
+  return (run.run.ownerNumbers ?? []).some((entry) => entry.trim() === senderId);
+}
+
+function buildLiveTaskControllerActionKey(params: {
+  ownerKey: string;
+  updateId: string;
+  normalizedAction: string;
+}): string {
+  return JSON.stringify([params.ownerKey.trim(), params.updateId.trim(), params.normalizedAction]);
+}
+
+function buildLiveTaskControllerHealth(): string {
+  const depth = getQueueSize(CommandLane.Controller);
+  if (depth > 1) {
+    return `busy (${depth} controller actions queued)`;
+  }
+  if (depth === 1) {
+    return "busy";
+  }
+  return "healthy";
+}
+
+function buildLiveTaskControllerReplayText(params: {
+  sessionKey: string;
+  record: TaskFlowControllerActionRecord;
+}): string {
+  const existingText = params.record.responseText?.trim();
+  if (existingText) {
+    return existingText;
+  }
+  const flowId = params.record.flowId?.trim();
+  if (flowId) {
+    const flow = getTaskFlowByIdForOwner({
+      flowId,
+      callerOwnerKey: params.sessionKey,
+    });
+    if (flow && isManagedLiveTaskFlow(flow)) {
+      return buildLiveTaskHandleStatusReply(reconcileFlow(flow)).text;
+    }
+  }
+  return params.record.kind === "create"
+    ? "Still processing your last control message.\nNext: /tasks"
+    : "That control action is already in progress.\nNext: /tasks";
+}
+
+function getBrowserLeaseHolderForOwner(ownerKey: string): TaskFlowRecord | undefined {
+  const lease = getTaskFlowBrowserLease();
+  if (!lease || lease.ownerKey !== ownerKey) {
+    return undefined;
+  }
+  const flow = getTaskFlowByIdForOwner({
+    flowId: lease.flowId,
+    callerOwnerKey: ownerKey,
+  });
+  return flow && isManagedLiveTaskFlow(flow) ? flow : undefined;
+}
+
 function getForegroundFlowForOwner(ownerKey: string): TaskFlowRecord | undefined {
   return listTaskFlowsForOwner({ callerOwnerKey: ownerKey })
     .filter((flow) => isManagedLiveTaskFlow(flow) && isActiveFlow(flow))
@@ -304,6 +395,44 @@ function extractQueuePosition(flow: TaskFlowRecord): number | undefined {
     : undefined;
 }
 
+function markFlowLost(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
+  const state = normalizeControllerStateJson(flow.stateJson);
+  if (state.controller.leaseToken) {
+    releaseTaskFlowBrowserLease({
+      flowId: flow.flowId,
+      token: state.controller.leaseToken,
+    });
+  } else if (getTaskFlowBrowserLease()?.flowId === flow.flowId) {
+    clearTaskFlowBrowserLease();
+  }
+  const updated =
+    updateManagedFlow(flow.flowId, (current) => ({
+      status: "lost",
+      blockedSummary: current.blockedSummary ?? "Runtime disappeared before the flow finished.",
+      waitJson: null,
+      endedAt: current.endedAt ?? now,
+      stateJson: buildStateJson({
+        flow: current,
+        controller: {
+          foreground: false,
+          browserLease: false,
+          leaseToken: undefined,
+        },
+        runtime: {
+          inlineActive: false,
+        },
+      }),
+    })) ?? flow;
+  return {
+    ...updated,
+    status: "lost",
+    blockedSummary: updated.blockedSummary ?? "Runtime disappeared before the flow finished.",
+    waitJson: null,
+    updatedAt: updated.updatedAt ?? now,
+    endedAt: updated.endedAt ?? now,
+  };
+}
+
 function reconcileFlow(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
   if (!isManagedLiveTaskFlow(flow) || isTerminalFlow(flow)) {
     return flow;
@@ -320,7 +449,13 @@ function reconcileFlow(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
     (state.controller.foreground || state.controller.browserLease);
   const hasLinkedTasks = hasActiveLinkedTasks(flow.flowId);
   const queued = hasQueuedRunForFlow(flow.ownerKey, flow.flowId);
+  const lease = getTaskFlowBrowserLease();
+  const leaseHeldByFlow =
+    lease?.flowId === flow.flowId && lease.ownerKey === flow.ownerKey ? lease : undefined;
   if (!hasInlineRuntime && !hasLegacyInlineRuntime && !hasLinkedTasks && !queued) {
+    if (leaseHeldByFlow || state.controller.browserLease || state.controller.foreground) {
+      return markFlowLost(flow, now);
+    }
     return {
       ...flow,
       status: "lost",
@@ -338,10 +473,16 @@ function reconcileFlow(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
   ) {
     const wait = flow.waitJson as Record<string, unknown>;
     const position = queuePositionForFlow(flow.ownerKey, flow.flowId);
+    const heldByFlow =
+      wait.kind === "browser_lease"
+        ? getBrowserLeaseHolderForOwner(flow.ownerKey)
+        : getForegroundFlowForOwner(flow.ownerKey);
     return {
       ...flow,
       waitJson: {
         ...wait,
+        ...(heldByFlow ? { heldByFlowId: heldByFlow.flowId } : {}),
+        ...(heldByFlow ? { heldByHandle: formatLiveTaskHandle(heldByFlow) } : {}),
         ...(typeof position === "number" ? { queuePosition: position } : {}),
       },
     };
@@ -425,9 +566,7 @@ export function resolveLiveTaskBoard(sessionKey: string): LiveTaskBoard {
   const foreground = flows.find(
     (flow) => normalizeControllerStateJson(flow.stateJson).controller.foreground,
   );
-  const browserHolder =
-    flows.find((flow) => normalizeControllerStateJson(flow.stateJson).controller.browserLease) ??
-    foreground;
+  const browserHolder = getBrowserLeaseHolderForOwner(sessionKey) ?? foreground;
   const waiting = flows
     .filter((flow) => flow.status === "waiting")
     .toSorted((left, right) => {
@@ -453,6 +592,7 @@ export function resolveLiveTaskBoard(sessionKey: string): LiveTaskBoard {
     blocked: flows.filter((flow) => flow.status === "blocked"),
     waiting,
     recent: flows.filter((flow) => isTerminalFlow(flow)).slice(0, 5),
+    controllerHealth: buildLiveTaskControllerHealth(),
   };
 }
 
@@ -489,9 +629,9 @@ export function buildLiveTaskBoardText(params: {
   if (board.all.length === 0) {
     return undefined;
   }
-  const lines = ["📋 Tasks"];
+  const lines = ["📋 Tasks", `Controller: ${board.controllerHealth}`];
   if (board.foreground) {
-    lines.push(`Foreground: ${formatFlowHeadline(board.foreground)}`);
+    lines.push("", `Foreground: ${formatFlowHeadline(board.foreground)}`);
     lines.push(`State: ${formatLiveTaskState(board.foreground)}`);
     lines.push(`Next: ${formatLiveTaskNextPhrases(board.foreground).join(" · ")}`);
   }
@@ -524,6 +664,11 @@ export function buildLiveTaskBoardText(params: {
       lines.push(`   Next: ${formatLiveTaskNextPhrases(flow).join(" · ")}`);
     }
   }
+  lines.push(
+    "",
+    "Legend: handles are short flow ids. States: running, waiting, blocked, lost.",
+    "Control: continue <handle> · cancel <handle> · retry <handle>",
+  );
   return lines.join("\n");
 }
 
@@ -532,20 +677,27 @@ export function buildLiveTaskStatusLine(sessionKey: string): string | undefined 
   if (board.all.length === 0) {
     return undefined;
   }
+  const statusPrefix = `📌 Tasks: controller ${board.controllerHealth}`;
   if (board.foreground) {
-    return `📌 Tasks: foreground ${formatFlowHeadline(board.foreground)} · ${formatLiveTaskState(board.foreground)}`;
+    const browserHolder =
+      board.browserHolder && board.browserHolder.flowId !== board.foreground.flowId
+        ? ` · browser ${formatLiveTaskHandle(board.browserHolder)}`
+        : board.browserHolder
+          ? ` · browser ${formatLiveTaskHandle(board.browserHolder)}`
+          : "";
+    return `${statusPrefix} · foreground ${formatFlowHeadline(board.foreground)}${browserHolder} · ${formatLiveTaskState(board.foreground)}`;
   }
   if (board.blocked.length > 0) {
     const blocked = board.blocked[0];
-    return `📌 Tasks: blocked ${formatFlowHeadline(blocked)} · ${formatLiveTaskState(blocked)}`;
+    return `${statusPrefix} · blocked ${formatFlowHeadline(blocked)} · ${formatLiveTaskState(blocked)}`;
   }
   if (board.waiting.length > 0) {
     const waiting = board.waiting[0];
-    return `📌 Tasks: waiting ${formatFlowHeadline(waiting)} · ${formatLiveTaskState(waiting)}`;
+    return `${statusPrefix} · waiting ${formatFlowHeadline(waiting)} · ${formatLiveTaskState(waiting)}`;
   }
   const recent = board.recent[0];
   return recent
-    ? `📌 Tasks: ${recent.status.replaceAll("_", " ")} ${formatFlowHeadline(recent)}`
+    ? `${statusPrefix} · ${recent.status.replaceAll("_", " ")} ${formatFlowHeadline(recent)}`
     : undefined;
 }
 
@@ -569,41 +721,79 @@ export function createQueuedLiveTaskFlow(params: {
   followupRun: FollowupRun;
 }): TaskFlowRecord {
   const foreground = getForegroundFlowForOwner(params.queueKey);
+  const browserHolder = getBrowserLeaseHolderForOwner(params.queueKey);
   const waitKind =
-    foreground && normalizeControllerStateJson(foreground.stateJson).controller.browserLease
+    browserHolder ||
+    (foreground && normalizeControllerStateJson(foreground.stateJson).controller.browserLease)
       ? "browser_lease"
       : waitKindFromText(params.followupRun.prompt);
-  const flow = createManagedTaskFlow({
-    ownerKey: params.queueKey,
-    controllerId: LIVE_TASK_CONTROLLER_ID,
-    requesterOrigin: params.followupRun.run.sessionKey
-      ? {
-          channel: params.followupRun.originatingChannel,
-          accountId: params.followupRun.originatingAccountId,
-          to: params.followupRun.originatingTo,
-          threadId: params.followupRun.originatingThreadId,
-        }
-      : undefined,
-    status: "waiting",
-    goal: summarizeGoal(params.followupRun),
-    currentStep: "Waiting for the foreground flow to clear.",
-    stateJson: buildStateJson({
-      controller: {
-        foreground: false,
-        browserLease: false,
-      },
-      request: {
-        prompt: params.followupRun.prompt,
-        summaryLine: params.followupRun.summaryLine,
-        waitKind,
-      },
-    }),
-    waitJson: buildWaitJson({
-      kind: waitKind,
-      heldByFlowId: foreground?.flowId,
-      queuePosition: getFollowupQueueDepthSafe(params.queueKey) + 1,
-    }),
-  });
+  const existingFlowId = params.followupRun.controller?.flowId?.trim();
+  const existing =
+    existingFlowId &&
+    getTaskFlowByIdForOwner({ flowId: existingFlowId, callerOwnerKey: params.queueKey });
+  const flow =
+    existing && isManagedLiveTaskFlow(existing)
+      ? updateManagedFlow(existing.flowId, (current) => ({
+          status: "waiting",
+          goal: summarizeGoal(params.followupRun),
+          currentStep: "Waiting for the foreground flow to clear.",
+          blockedTaskId: null,
+          blockedSummary: null,
+          endedAt: null,
+          waitJson: buildWaitJson({
+            kind: waitKind,
+            heldByFlowId: browserHolder?.flowId ?? foreground?.flowId,
+            queuePosition: getFollowupQueueDepthSafe(params.queueKey) + 1,
+          }),
+          stateJson: buildStateJson({
+            flow: current,
+            controller: {
+              foreground: false,
+              browserLease: false,
+              leaseToken: undefined,
+            },
+            runtime: {
+              inlineActive: false,
+            },
+            request: {
+              prompt: params.followupRun.prompt,
+              summaryLine: params.followupRun.summaryLine,
+              waitKind,
+            },
+          }),
+        }))
+      : createManagedTaskFlow({
+          ownerKey: params.queueKey,
+          controllerId: LIVE_TASK_CONTROLLER_ID,
+          requesterOrigin: params.followupRun.run.sessionKey
+            ? {
+                channel: params.followupRun.originatingChannel,
+                accountId: params.followupRun.originatingAccountId,
+                to: params.followupRun.originatingTo,
+                threadId: params.followupRun.originatingThreadId,
+              }
+            : undefined,
+          status: "waiting",
+          goal: summarizeGoal(params.followupRun),
+          currentStep: "Waiting for the foreground flow to clear.",
+          stateJson: buildStateJson({
+            controller: {
+              foreground: false,
+              browserLease: false,
+              leaseToken: undefined,
+            },
+            request: {
+              prompt: params.followupRun.prompt,
+              summaryLine: params.followupRun.summaryLine,
+              waitKind,
+            },
+          }),
+          waitJson: buildWaitJson({
+            kind: waitKind,
+            heldByFlowId: browserHolder?.flowId ?? foreground?.flowId,
+            queuePosition: getFollowupQueueDepthSafe(params.queueKey) + 1,
+          }),
+        });
   applyControllerMetadata(params.followupRun, {
     flowId: flow.flowId,
     waitKind,
@@ -626,7 +816,7 @@ export function beginForegroundLiveTaskFlow(params: {
   const existing =
     existingFlowId &&
     getTaskFlowByIdForOwner({ flowId: existingFlowId, callerOwnerKey: params.queueKey });
-  const flow =
+  let flow =
     existing && isManagedLiveTaskFlow(existing)
       ? updateManagedFlow(existing.flowId, (current) => ({
           status: "running",
@@ -640,6 +830,9 @@ export function beginForegroundLiveTaskFlow(params: {
             controller: {
               foreground: true,
               browserLease,
+              leaseToken: browserLease
+                ? normalizeControllerStateJson(current.stateJson).controller.leaseToken
+                : undefined,
             },
             runtime: {
               inlineActive: true,
@@ -663,6 +856,7 @@ export function beginForegroundLiveTaskFlow(params: {
             controller: {
               foreground: true,
               browserLease,
+              leaseToken: undefined,
             },
             runtime: {
               inlineActive: true,
@@ -675,7 +869,7 @@ export function beginForegroundLiveTaskFlow(params: {
           }),
         });
   if (!flow) {
-    const fallback = createManagedTaskFlow({
+    flow = createManagedTaskFlow({
       ownerKey: params.queueKey,
       controllerId: LIVE_TASK_CONTROLLER_ID,
       status: "running",
@@ -685,6 +879,7 @@ export function beginForegroundLiveTaskFlow(params: {
         controller: {
           foreground: true,
           browserLease,
+          leaseToken: undefined,
         },
         runtime: {
           inlineActive: true,
@@ -696,20 +891,49 @@ export function beginForegroundLiveTaskFlow(params: {
         },
       }),
     });
-    applyControllerMetadata(params.followupRun, {
-      flowId: fallback.flowId,
-      waitKind: waitKindFromText(params.followupRun.prompt),
-      skipQueuedLifecycle: true,
-      browserLease,
-    });
-    clearManagedFlowMarkers({
+  }
+  if (browserLease) {
+    const currentState = normalizeControllerStateJson(flow.stateJson);
+    const acquired = acquireTaskFlowBrowserLease({
       ownerKey: params.queueKey,
-      keepFlowId: fallback.flowId,
-      clearForeground: true,
-      clearBrowserLease: true,
-      clearInlineRuntime: true,
+      flowId: flow.flowId,
+      token: currentState.controller.leaseToken,
     });
-    return fallback;
+    if (acquired.applied) {
+      flow =
+        updateManagedFlow(flow.flowId, (current) => ({
+          stateJson: buildStateJson({
+            flow: current,
+            controller: {
+              foreground: true,
+              browserLease: true,
+              leaseToken: acquired.lease.token,
+            },
+            runtime: {
+              inlineActive: true,
+            },
+          }),
+        })) ?? flow;
+    }
+  } else {
+    const currentState = normalizeControllerStateJson(flow.stateJson);
+    if (currentState.controller.leaseToken) {
+      releaseTaskFlowBrowserLease({
+        flowId: flow.flowId,
+        token: currentState.controller.leaseToken,
+      });
+      flow =
+        updateManagedFlow(flow.flowId, (current) => ({
+          stateJson: buildStateJson({
+            flow: current,
+            controller: {
+              foreground: true,
+              browserLease: false,
+              leaseToken: undefined,
+            },
+          }),
+        })) ?? flow;
+    }
   }
   applyControllerMetadata(params.followupRun, {
     flowId: flow.flowId,
@@ -738,18 +962,29 @@ export function settleLiveTaskFlow(params: {
   if (!flowId) {
     return undefined;
   }
-  return updateManagedFlow(flowId, (flow) => ({
+  const flow = getTaskFlowById(flowId);
+  const state = flow ? normalizeControllerStateJson(flow.stateJson) : undefined;
+  if (state?.controller.leaseToken) {
+    releaseTaskFlowBrowserLease({
+      flowId,
+      token: state.controller.leaseToken,
+    });
+  } else if (getTaskFlowBrowserLease()?.flowId === flowId) {
+    clearTaskFlowBrowserLease();
+  }
+  return updateManagedFlow(flowId, (current) => ({
     status: params.status,
-    currentStep: params.currentStep ?? flow.currentStep,
+    currentStep: params.currentStep ?? current.currentStep,
     blockedSummary: params.blockedSummary ?? null,
     blockedTaskId: null,
     waitJson: null,
     endedAt: Date.now(),
     stateJson: buildStateJson({
-      flow,
+      flow: current,
       controller: {
         foreground: false,
         browserLease: false,
+        leaseToken: undefined,
       },
       runtime: {
         inlineActive: false,
@@ -772,6 +1007,13 @@ export function buildQueuedLiveTaskReply(params: { queueKey: string; flow: TaskF
     `Next: ${formatLiveTaskNextPhrases(params.flow).join(" · ")}`,
   ];
   return { text: lines.join("\n") };
+}
+
+export function buildForegroundLiveTaskAck(flow: TaskFlowRecord): { text: string } {
+  const handle = formatLiveTaskHandle(flow);
+  return {
+    text: [`Flow ${handle} is now running.`, `Next: /tasks ${handle}`].join("\n"),
+  };
 }
 
 export function buildDidNotQueueLiveTaskReply(flow: TaskFlowRecord): { text: string } {
@@ -831,9 +1073,25 @@ function promoteForegroundFlow(params: {
       flow: current,
       controller: {
         foreground: true,
+        browserLease: normalizeControllerStateJson(current.stateJson).controller.browserLease,
+        leaseToken: normalizeControllerStateJson(current.stateJson).controller.leaseToken,
       },
     }),
   }));
+}
+
+function listActiveCandidateFlows(sessionKey: string): TaskFlowRecord[] {
+  const board = resolveLiveTaskBoard(sessionKey);
+  return board.all.filter((flow) => isActiveFlow(flow));
+}
+
+function looksLikeShortTextTurn(text: string): boolean {
+  const trimmed = text.trim();
+  return Boolean(trimmed) && trimmed.length <= 220 && !trimmed.includes("\n");
+}
+
+export function matchesForegroundSteer(text: string): boolean {
+  return /\b(continue|resume|keep going|go ahead|finish|yes|do it|work on|focus on)\b/i.test(text);
 }
 
 export function matchesBlockingQuestion(text: string): boolean {
@@ -843,19 +1101,234 @@ export function matchesBlockingQuestion(text: string): boolean {
 }
 
 export function matchesSteerContinue(text: string): boolean {
-  return /\bcontinue\b/i.test(text) && /\b(browser|warm|reply|replies)\b/i.test(text);
+  return matchesForegroundSteer(text) && /\b(browser|warm|reply|replies)\b/i.test(text);
 }
 
 export function parseLiveTaskControlInput(
   text: string,
-): { action: "continue" | "cancel" | "retry"; token: string } | undefined {
-  const match = text.trim().match(/^(continue|cancel|retry)\s+([A-Za-z0-9-]+)$/i);
+): { action: "continue" | "cancel" | "retry"; token: string; confirmed: boolean } | undefined {
+  const match = text.trim().match(/^(continue|cancel|retry)\s+([A-Za-z0-9-]+)(?:\s+(confirm))?$/i);
   if (!match) {
     return undefined;
   }
   return {
     action: match[1].toLowerCase() as "continue" | "cancel" | "retry",
     token: match[2],
+    confirmed: match[3]?.toLowerCase() === "confirm",
+  };
+}
+
+export function buildLiveTaskDisambiguationReply(sessionKey: string): { text: string } | undefined {
+  const candidates = listActiveCandidateFlows(sessionKey).slice(0, 4);
+  if (candidates.length <= 1) {
+    return undefined;
+  }
+  const lines = ["I need an explicit handle before I steer anything.", "Active flows:"];
+  for (const [index, flow] of candidates.entries()) {
+    lines.push(`${index + 1}. ${formatFlowHeadline(flow)} · ${formatLiveTaskState(flow)}`);
+  }
+  lines.push("Next: continue <handle> · cancel <handle> · /tasks");
+  return { text: lines.join("\n") };
+}
+
+export function maybeAttachLiveTaskAnswer(params: {
+  sessionKey: string;
+  followupRun: FollowupRun;
+}): { attached: boolean; ambiguityReply?: { text: string } } {
+  const board = resolveLiveTaskBoard(params.sessionKey);
+  if (!looksLikeShortTextTurn(params.followupRun.prompt)) {
+    return { attached: false };
+  }
+  if (board.blocked.length === 1) {
+    const blocked = board.blocked[0];
+    applyControllerMetadata(params.followupRun, {
+      flowId: blocked.flowId,
+      waitKind:
+        normalizeControllerStateJson(blocked.stateJson).request?.waitKind ??
+        waitKindFromText(params.followupRun.prompt),
+      skipQueuedLifecycle: true,
+      browserLease:
+        normalizeControllerStateJson(blocked.stateJson).request?.waitKind === "browser_lease",
+    });
+    return { attached: true };
+  }
+  if (board.blocked.length > 1) {
+    return {
+      attached: false,
+      ambiguityReply: buildLiveTaskDisambiguationReply(params.sessionKey),
+    };
+  }
+  return { attached: false };
+}
+
+export function resolveLiveTaskControllerAction(params: {
+  sessionKey: string;
+  text: string;
+  followupRun: FollowupRun;
+  explicit?: ReturnType<typeof parseLiveTaskControlInput>;
+  active?: boolean;
+}):
+  | {
+      kind: TaskFlowControllerActionKind;
+      normalizedAction: string;
+      flowId?: string;
+    }
+  | undefined {
+  const text = params.text.trim();
+  if (params.explicit) {
+    const flow = resolveLiveTaskFlow(params.sessionKey, params.explicit.token);
+    return {
+      kind: params.explicit.action === "continue" ? "steer" : params.explicit.action,
+      normalizedAction: `${params.explicit.action}:${params.explicit.token.toLowerCase()}`,
+      flowId: flow?.flowId,
+    };
+  }
+  if (matchesForegroundSteer(text) && params.active) {
+    const foreground = getForegroundFlowForOwner(params.sessionKey);
+    if (!foreground) {
+      return undefined;
+    }
+    return {
+      kind: "steer",
+      normalizedAction: `steer:${formatLiveTaskHandle(foreground)}`,
+      flowId: foreground.flowId,
+    };
+  }
+  if (looksLikeShortTextTurn(text)) {
+    const blocked = resolveLiveTaskBoard(params.sessionKey).blocked;
+    if (blocked.length === 1) {
+      return {
+        kind: "steer",
+        normalizedAction: `steer:${formatLiveTaskHandle(blocked[0])}`,
+        flowId: blocked[0].flowId,
+      };
+    }
+  }
+  return {
+    kind: "create",
+    normalizedAction: "create",
+  };
+}
+
+export function beginLiveTaskControllerAction(params: {
+  sessionKey: string;
+  followupRun: FollowupRun;
+  kind: TaskFlowControllerActionKind;
+  normalizedAction: string;
+  flowId?: string;
+}):
+  | {
+      actionKey: string;
+      replayText?: string;
+      flowId?: string;
+    }
+  | undefined {
+  const updateId = params.followupRun.messageId?.trim();
+  if (!updateId) {
+    return undefined;
+  }
+  const actionKey = buildLiveTaskControllerActionKey({
+    ownerKey: params.sessionKey,
+    updateId,
+    normalizedAction: params.normalizedAction,
+  });
+  const existing = getTaskFlowControllerAction(actionKey);
+  if (existing) {
+    return {
+      actionKey,
+      replayText: buildLiveTaskControllerReplayText({
+        sessionKey: params.sessionKey,
+        record: existing,
+      }),
+      flowId: existing.flowId,
+    };
+  }
+  const started = beginTaskFlowControllerAction({
+    actionKey,
+    ownerKey: params.sessionKey,
+    senderId: params.followupRun.run.senderId,
+    updateId,
+    normalizedAction: params.normalizedAction,
+    kind: params.kind,
+  });
+  if (params.flowId && started.record.flowId !== params.flowId) {
+    updateTaskFlowControllerAction({
+      actionKey,
+      expectedRevision: started.record.revision,
+      flowId: params.flowId,
+    });
+  }
+  return {
+    actionKey,
+    flowId: params.flowId ?? started.record.flowId,
+  };
+}
+
+export function completeLiveTaskControllerAction(params: {
+  actionKey?: string;
+  flowId?: string;
+  text: string;
+}): void {
+  const actionKey = params.actionKey?.trim();
+  if (!actionKey) {
+    return;
+  }
+  const existing = getTaskFlowControllerAction(actionKey);
+  if (!existing) {
+    return;
+  }
+  updateTaskFlowControllerAction({
+    actionKey,
+    expectedRevision: existing.revision,
+    flowId: params.flowId ?? existing.flowId,
+    responseText: params.text,
+    status: "completed",
+  });
+}
+
+export function setLiveTaskControllerActionReplyText(params: {
+  actionKey?: string;
+  flowId?: string;
+  text: string;
+}): void {
+  const actionKey = params.actionKey?.trim();
+  if (!actionKey) {
+    return;
+  }
+  const existing = getTaskFlowControllerAction(actionKey);
+  if (!existing) {
+    return;
+  }
+  updateTaskFlowControllerAction({
+    actionKey,
+    expectedRevision: existing.revision,
+    flowId: params.flowId ?? existing.flowId,
+    responseText: params.text,
+  });
+}
+
+export function setLiveTaskControllerActionFlowId(params: {
+  actionKey?: string;
+  flowId: string;
+}): void {
+  const actionKey = params.actionKey?.trim();
+  if (!actionKey) {
+    return;
+  }
+  const existing = getTaskFlowControllerAction(actionKey);
+  if (!existing || existing.flowId === params.flowId) {
+    return;
+  }
+  updateTaskFlowControllerAction({
+    actionKey,
+    expectedRevision: existing.revision,
+    flowId: params.flowId,
+  });
+}
+
+export function buildUnauthorizedLiveTaskReply(): { text: string } {
+  return {
+    text: "This Telegram control lane only accepts the authorized operator.",
   };
 }
 
@@ -903,15 +1376,41 @@ export function continueLiveTaskFlow(params: {
   };
 }
 
-export function cancelLiveTaskFlow(params: { sessionKey: string; flow: TaskFlowRecord }): {
-  text: string;
-} {
+export function buildLiveTaskHandleStatusReply(flow: TaskFlowRecord): { text: string } {
+  return {
+    text: [
+      `Flow ${formatLiveTaskHandle(flow)} is ${flow.status.replaceAll("_", " ")}.`,
+      `State: ${formatLiveTaskState(flow)}`,
+      `Next: ${formatLiveTaskNextPhrases(flow).join(" · ")}`,
+    ].join("\n"),
+  };
+}
+
+export function cancelLiveTaskFlow(params: {
+  sessionKey: string;
+  flow: TaskFlowRecord;
+  confirmed?: boolean;
+}): { text: string } {
   const handle = formatLiveTaskHandle(params.flow);
   removeFollowupQueueItems(
     params.sessionKey,
     (item) => item.controller?.flowId === params.flow.flowId,
   );
   const state = normalizeControllerStateJson(params.flow.stateJson);
+  if (
+    !params.confirmed &&
+    state.controller.foreground &&
+    state.controller.browserLease &&
+    params.flow.status === "running"
+  ) {
+    return {
+      text: [
+        `Flow ${handle} is actively holding the live browser.`,
+        `Reply "cancel ${handle} confirm" to interrupt it.`,
+        `Next: /tasks ${handle}`,
+      ].join("\n"),
+    };
+  }
   if (state.controller.foreground) {
     replyRunRegistry.abort(params.sessionKey);
     const sessionId = resolveActiveEmbeddedRunSessionId(params.sessionKey);
@@ -976,6 +1475,7 @@ export function queueLiveTaskFlowForRetry(params: {
       controller: {
         foreground: false,
         browserLease: false,
+        leaseToken: undefined,
       },
       runtime: {
         inlineActive: false,

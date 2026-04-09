@@ -18,7 +18,12 @@ import { emitAgentEvent } from "../../infra/agent-events.js";
 import { emitDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { generateSecureUuid } from "../../infra/secure-random.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
-import { CommandLaneClearedError, GatewayDrainingError } from "../../process/command-queue.js";
+import {
+  CommandLaneClearedError,
+  GatewayDrainingError,
+  enqueueCommandInLane,
+} from "../../process/command-queue.js";
+import { CommandLane } from "../../process/lanes.js";
 import { defaultRuntime } from "../../runtime.js";
 import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
 import {
@@ -50,21 +55,32 @@ import { createAudioAsVoiceBuffer, createBlockReplyPipeline } from "./block-repl
 import { resolveEffectiveBlockStreamingConfig } from "./block-streaming.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import {
+  beginLiveTaskControllerAction,
+  buildForegroundLiveTaskAck,
+  buildLiveTaskDisambiguationReply,
+  buildLiveTaskHandleStatusReply,
   beginForegroundLiveTaskFlow,
   buildBlockingLiveTaskReply,
   buildDidNotQueueLiveTaskReply,
   buildQueuedLiveTaskReply,
   cancelLiveTaskFlow,
+  completeLiveTaskControllerAction,
   continueLiveTaskFlow,
   createQueuedLiveTaskFlow,
+  isAuthorizedLiveTaskOperator,
   isLiveTaskDirectMessage,
   matchesBlockingQuestion,
-  matchesSteerContinue,
+  matchesForegroundSteer,
+  maybeAttachLiveTaskAnswer,
   parseLiveTaskControlInput,
   queueLiveTaskFlowForRetry,
+  resolveLiveTaskControllerAction,
   resolveLiveTaskFlow,
+  setLiveTaskControllerActionReplyText,
+  setLiveTaskControllerActionFlowId,
   settleLiveTaskFlow,
   steerForegroundLiveTask,
+  buildUnauthorizedLiveTaskReply,
 } from "./live-task-control.js";
 import { resolveOriginMessageProvider, resolveOriginMessageTo } from "./origin-routing.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
@@ -296,67 +312,173 @@ export async function runReplyAgent(params: {
   const liveTaskDm = isLiveTaskDirectMessage(followupRun);
   const liveTaskInput = followupRun.summaryLine?.trim() || commandBody.trim();
   const liveTaskControl = liveTaskDm ? parseLiveTaskControlInput(liveTaskInput) : undefined;
+  let liveTaskActionKey: string | undefined;
 
-  if (liveTaskDm && matchesBlockingQuestion(liveTaskInput) && isActive) {
-    await touchActiveSessionEntry();
-    typing.cleanup();
-    return (
-      buildBlockingLiveTaskReply(queueKey) ?? {
-        text: "No managed flow is blocking right now.",
+  if (liveTaskDm) {
+    const controllerReply = await enqueueCommandInLane(CommandLane.Controller, async () => {
+      if (!isAuthorizedLiveTaskOperator(followupRun)) {
+        return buildUnauthorizedLiveTaskReply();
       }
-    );
-  }
 
-  if (liveTaskDm && matchesSteerContinue(liveTaskInput) && isActive) {
-    const steered = steerForegroundLiveTask({
-      sessionKey: queueKey,
-      prompt: followupRun.prompt,
-      queueEmbeddedPiMessage: (sessionId, text) => queueEmbeddedPiMessage(sessionId, text),
+      const controllerAction = resolveLiveTaskControllerAction({
+        sessionKey: queueKey,
+        text: liveTaskInput,
+        followupRun,
+        explicit: liveTaskControl,
+        active: isActive,
+      });
+      const actionState = controllerAction
+        ? beginLiveTaskControllerAction({
+            sessionKey: queueKey,
+            followupRun,
+            kind: controllerAction.kind,
+            normalizedAction: controllerAction.normalizedAction,
+            flowId: controllerAction.flowId,
+          })
+        : undefined;
+      liveTaskActionKey = actionState?.actionKey;
+      if (actionState?.replayText) {
+        return { text: actionState.replayText };
+      }
+
+      if (matchesBlockingQuestion(liveTaskInput) && isActive) {
+        const reply = buildBlockingLiveTaskReply(queueKey) ?? {
+          text: "No managed flow is blocking right now.",
+        };
+        completeLiveTaskControllerAction({
+          actionKey: liveTaskActionKey,
+          text: reply.text,
+        });
+        return reply;
+      }
+
+      if (isActive && matchesForegroundSteer(liveTaskInput) && !liveTaskControl) {
+        const ambiguity = buildLiveTaskDisambiguationReply(queueKey);
+        if (ambiguity) {
+          completeLiveTaskControllerAction({
+            actionKey: liveTaskActionKey,
+            text: ambiguity.text,
+          });
+          return ambiguity;
+        }
+      }
+
+      if (liveTaskControl) {
+        const flow = resolveLiveTaskFlow(queueKey, liveTaskControl.token);
+        if (!flow) {
+          const reply = {
+            text: `Unknown flow ${liveTaskControl.token}. Use /tasks to see the active handles.`,
+          };
+          completeLiveTaskControllerAction({
+            actionKey: liveTaskActionKey,
+            text: reply.text,
+          });
+          return reply;
+        }
+        if (liveTaskControl.action === "cancel") {
+          const reply = cancelLiveTaskFlow({
+            sessionKey: queueKey,
+            flow,
+            confirmed: liveTaskControl.confirmed,
+          });
+          completeLiveTaskControllerAction({
+            actionKey: liveTaskActionKey,
+            flowId: flow.flowId,
+            text: reply.text,
+          });
+          return reply;
+        }
+        if (liveTaskControl.action === "continue") {
+          if (flow.status === "running" || flow.status === "queued" || flow.status === "waiting") {
+            const reply =
+              continueLiveTaskFlow({
+                sessionKey: queueKey,
+                flow,
+              }) ?? buildLiveTaskHandleStatusReply(flow);
+            completeLiveTaskControllerAction({
+              actionKey: liveTaskActionKey,
+              flowId: flow.flowId,
+              text: reply.text,
+            });
+            return reply;
+          }
+          const reply = buildLiveTaskHandleStatusReply(flow);
+          completeLiveTaskControllerAction({
+            actionKey: liveTaskActionKey,
+            flowId: flow.flowId,
+            text: reply.text,
+          });
+          return reply;
+        }
+      }
+
+      if (isActive && matchesForegroundSteer(liveTaskInput)) {
+        const steered = steerForegroundLiveTask({
+          sessionKey: queueKey,
+          prompt: followupRun.prompt,
+          queueEmbeddedPiMessage: (sessionId, text) => queueEmbeddedPiMessage(sessionId, text),
+        });
+        if (steered) {
+          completeLiveTaskControllerAction({
+            actionKey: liveTaskActionKey,
+            flowId: controllerAction?.flowId,
+            text: steered.text,
+          });
+          return steered;
+        }
+      }
+
+      const attachment = maybeAttachLiveTaskAnswer({
+        sessionKey: queueKey,
+        followupRun,
+      });
+      if (attachment.ambiguityReply) {
+        completeLiveTaskControllerAction({
+          actionKey: liveTaskActionKey,
+          text: attachment.ambiguityReply.text,
+        });
+        return attachment.ambiguityReply;
+      }
+
+      return undefined;
     });
-    if (steered) {
+
+    if (controllerReply) {
       await touchActiveSessionEntry();
       typing.cleanup();
-      return steered;
+      return controllerReply;
     }
   }
 
-  if (liveTaskDm && liveTaskControl) {
+  if (liveTaskDm && liveTaskControl?.action === "retry") {
     const flow = resolveLiveTaskFlow(queueKey, liveTaskControl.token);
     if (!flow) {
-      await touchActiveSessionEntry();
-      typing.cleanup();
-      return {
+      const reply = {
         text: `Unknown flow ${liveTaskControl.token}. Use /tasks to see the active handles.`,
       };
-    }
-    if (liveTaskControl.action === "cancel") {
+      completeLiveTaskControllerAction({
+        actionKey: liveTaskActionKey,
+        text: reply.text,
+      });
       await touchActiveSessionEntry();
       typing.cleanup();
-      return cancelLiveTaskFlow({
-        sessionKey: queueKey,
-        flow,
-      });
+      return reply;
     }
-    if (
-      liveTaskControl.action === "continue" &&
-      (flow.status === "running" || flow.status === "queued" || flow.status === "waiting")
-    ) {
-      await touchActiveSessionEntry();
-      typing.cleanup();
-      return continueLiveTaskFlow({
-        sessionKey: queueKey,
-        flow,
-      });
-    }
-    await touchActiveSessionEntry();
-    typing.cleanup();
-    return queueLiveTaskFlowForRetry({
+    const reply = queueLiveTaskFlowForRetry({
       sessionKey: queueKey,
       flow,
       template: followupRun,
       enqueueFollowupRun: (run) =>
         enqueueFollowupRun(queueKey, run, resolvedQueue, "prompt", queuedRunFollowupTurn, true),
     });
+    completeLiveTaskControllerAction({
+      actionKey: liveTaskActionKey,
+      flowId: flow.flowId,
+      text: reply.text,
+    });
+    await touchActiveSessionEntry();
+    typing.cleanup();
+    return reply;
   }
 
   if (activeRunQueueAction === "drop") {
@@ -403,12 +525,24 @@ export async function runReplyAgent(params: {
           blockedSummary:
             "The flow was not queued because an equivalent request was already pending.",
         });
-        return buildDidNotQueueLiveTaskReply(liveTaskFlow);
+        const reply = buildDidNotQueueLiveTaskReply(liveTaskFlow);
+        completeLiveTaskControllerAction({
+          actionKey: liveTaskActionKey,
+          flowId: liveTaskFlow.flowId,
+          text: reply.text,
+        });
+        return reply;
       }
-      return buildQueuedLiveTaskReply({
+      const reply = buildQueuedLiveTaskReply({
         queueKey,
         flow: liveTaskFlow,
       });
+      completeLiveTaskControllerAction({
+        actionKey: liveTaskActionKey,
+        flowId: liveTaskFlow.flowId,
+        text: reply.text,
+      });
+      return reply;
     }
     return undefined;
   }
@@ -440,6 +574,40 @@ export async function runReplyAgent(params: {
         followupRun,
       })
     : undefined;
+  if (liveTaskFlow) {
+    setLiveTaskControllerActionFlowId({
+      actionKey: liveTaskActionKey,
+      flowId: liveTaskFlow.flowId,
+    });
+    const liveTaskAck = buildForegroundLiveTaskAck(liveTaskFlow);
+    setLiveTaskControllerActionReplyText({
+      actionKey: liveTaskActionKey,
+      flowId: liveTaskFlow.flowId,
+      text: liveTaskAck.text,
+    });
+    await sendQueueLifecyclePayload(liveTaskAck);
+  }
+  const extractLiveTaskActionText = (
+    payload: ReplyPayload | ReplyPayload[] | undefined,
+    status: "succeeded" | "failed" | "cancelled" | "lost",
+    blockedSummary?: string,
+  ): string | undefined => {
+    const payloads = Array.isArray(payload) ? payload : payload ? [payload] : [];
+    const text = payloads
+      .map((entry) => entry.text?.trim())
+      .filter((entry): entry is string => Boolean(entry))
+      .join("\n\n");
+    if (text) {
+      return text;
+    }
+    if (blockedSummary?.trim()) {
+      return blockedSummary;
+    }
+    if (!liveTaskFlow) {
+      return undefined;
+    }
+    return `Flow ${liveTaskFlow.flowId.slice(0, 8)} ${status.replaceAll("_", " ")}.`;
+  };
   const finalizeLiveTask = (
     payload: ReplyPayload | ReplyPayload[] | undefined,
     status: "succeeded" | "failed" | "cancelled" | "lost",
@@ -451,6 +619,14 @@ export async function runReplyAgent(params: {
         status,
         blockedSummary,
       });
+      const actionText = extractLiveTaskActionText(payload, status, blockedSummary);
+      if (actionText) {
+        completeLiveTaskControllerAction({
+          actionKey: liveTaskActionKey,
+          flowId: liveTaskFlow.flowId,
+          text: actionText,
+        });
+      }
     }
     return finalizeWithFollowup(payload, queueKey, runFollowupTurn);
   };

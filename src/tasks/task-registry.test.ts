@@ -202,6 +202,7 @@ function configureInMemoryTaskStoresForLinkValidationTests() {
     store: {
       loadSnapshot: () => ({
         flows: new Map(),
+        controllerActions: new Map(),
       }),
       saveSnapshot: () => {},
       upsertFlow: () => {},

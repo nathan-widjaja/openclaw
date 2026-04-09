@@ -200,6 +200,7 @@ describe("task-flow-registry", () => {
       store: {
         loadSnapshot: () => ({
           flows: new Map(),
+          controllerActions: new Map(),
         }),
         saveSnapshot: () => {},
       },
@@ -256,6 +257,7 @@ describe("task-flow-registry", () => {
               },
             ],
           ]),
+          controllerActions: new Map(),
         }),
         saveSnapshot: () => {},
       },
@@ -264,6 +266,42 @@ describe("task-flow-registry", () => {
     expect(getTaskFlowById("legacy-managed")).toMatchObject({
       flowId: "legacy-managed",
       syncMode: "managed",
+      controllerId: "core/legacy-restored",
+    });
+  });
+
+  it("restores older store snapshots that do not include controller action metadata", () => {
+    configureTaskFlowRegistryRuntime({
+      store: {
+        loadSnapshot: () =>
+          ({
+            flows: new Map([
+              [
+                "legacy-snapshot",
+                {
+                  flowId: "legacy-snapshot",
+                  syncMode: "managed",
+                  ownerKey: "agent:main:main",
+                  revision: 0,
+                  status: "queued",
+                  notifyPolicy: "done_only",
+                  goal: "Legacy snapshot flow",
+                  createdAt: 10,
+                  updatedAt: 10,
+                },
+              ],
+            ]),
+          }) as unknown as ReturnType<
+            NonNullable<
+              Parameters<typeof configureTaskFlowRegistryRuntime>[0]["store"]
+            >["loadSnapshot"]
+          >,
+        saveSnapshot: () => {},
+      },
+    });
+
+    expect(getTaskFlowById("legacy-snapshot")).toMatchObject({
+      flowId: "legacy-snapshot",
       controllerId: "core/legacy-restored",
     });
   });

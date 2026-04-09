@@ -65,6 +65,7 @@ async function withAcpManagerTaskStateDir(run: (root: string) => Promise<void>):
       store: {
         loadSnapshot: () => ({
           flows: new Map(),
+          controllerActions: new Map(),
         }),
         saveSnapshot: () => {},
         upsertFlow: () => {},

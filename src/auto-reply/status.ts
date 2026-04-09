@@ -907,6 +907,12 @@ export function buildHelpMessage(cfg?: OpenClawConfig): string {
   lines.push("  /status  |  /tasks  |  /whoami  |  /context");
   lines.push("");
 
+  lines.push("Operator");
+  lines.push("  Handles are short flow ids shown by /tasks");
+  lines.push("  continue <handle>  |  cancel <handle>  |  retry <handle>");
+  lines.push("  cancel <handle> confirm  (interrupts a live browser flow)");
+  lines.push("");
+
   lines.push("Skills");
   lines.push("  /skill <name> [input]");
 

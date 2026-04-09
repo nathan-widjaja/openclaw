@@ -7,6 +7,9 @@ import {
   type TaskFlowRegistryObserverEvent,
 } from "./task-flow-registry.store.js";
 import type {
+  TaskFlowBrowserLeaseRecord,
+  TaskFlowControllerActionKind,
+  TaskFlowControllerActionRecord,
   TaskFlowRecord,
   TaskFlowStatus,
   TaskFlowSyncMode,
@@ -16,6 +19,8 @@ import type { TaskNotifyPolicy, TaskRecord } from "./task-registry.types.js";
 
 const log = createSubsystemLogger("tasks/task-flow-registry");
 const flows = new Map<string, TaskFlowRecord>();
+const controllerActions = new Map<string, TaskFlowControllerActionRecord>();
+let browserLease: TaskFlowBrowserLeaseRecord | undefined;
 let restoreAttempted = false;
 let restoreFailureMessage: string | null = null;
 
@@ -87,6 +92,20 @@ function cloneFlowRecord(record: TaskFlowRecord): TaskFlowRecord {
   };
 }
 
+function cloneControllerActionRecord(
+  record: TaskFlowControllerActionRecord,
+): TaskFlowControllerActionRecord {
+  return {
+    ...record,
+  };
+}
+
+function cloneBrowserLeaseRecord(
+  record: TaskFlowBrowserLeaseRecord | undefined,
+): TaskFlowBrowserLeaseRecord | undefined {
+  return record ? { ...record } : undefined;
+}
+
 function normalizeRestoredFlowRecord(record: TaskFlowRecord): TaskFlowRecord {
   const syncMode = record.syncMode === "task_mirrored" ? "task_mirrored" : "managed";
   const controllerId =
@@ -116,6 +135,12 @@ function normalizeRestoredFlowRecord(record: TaskFlowRecord): TaskFlowRecord {
 
 function snapshotFlowRecords(source: ReadonlyMap<string, TaskFlowRecord>): TaskFlowRecord[] {
   return [...source.values()].map((record) => cloneFlowRecord(record));
+}
+
+function snapshotControllerActionRecords(
+  source: ReadonlyMap<string, TaskFlowControllerActionRecord>,
+): TaskFlowControllerActionRecord[] {
+  return [...source.values()].map((record) => cloneControllerActionRecord(record));
 }
 
 function emitFlowRegistryObserverEvent(createEvent: () => TaskFlowRegistryObserverEvent): void {
@@ -206,12 +231,19 @@ function ensureFlowRegistryReady() {
   try {
     const restored = getTaskFlowRegistryStore().loadSnapshot();
     flows.clear();
+    controllerActions.clear();
+    browserLease = cloneBrowserLeaseRecord(restored.browserLease);
     for (const [flowId, flow] of restored.flows) {
       flows.set(flowId, normalizeRestoredFlowRecord(flow));
+    }
+    for (const [actionKey, action] of restored.controllerActions ?? new Map()) {
+      controllerActions.set(actionKey, cloneControllerActionRecord(action));
     }
     restoreFailureMessage = null;
   } catch (error) {
     flows.clear();
+    controllerActions.clear();
+    browserLease = undefined;
     restoreFailureMessage = error instanceof Error ? error.message : String(error);
     log.warn("Failed to restore task-flow registry", { error });
     return;
@@ -230,6 +262,13 @@ export function getTaskFlowRegistryRestoreFailure(): string | null {
 function persistFlowRegistry() {
   getTaskFlowRegistryStore().saveSnapshot({
     flows: new Map(snapshotFlowRecords(flows).map((flow) => [flow.flowId, flow])),
+    controllerActions: new Map(
+      snapshotControllerActionRecords(controllerActions).map((record) => [
+        record.actionKey,
+        record,
+      ]),
+    ),
+    browserLease: cloneBrowserLeaseRecord(browserLease),
   });
 }
 
@@ -703,8 +742,203 @@ export function deleteTaskFlowRecordById(flowId: string): boolean {
   return true;
 }
 
+function pruneControllerActions(): void {
+  if (controllerActions.size <= 256) {
+    return;
+  }
+  const completed = [...controllerActions.values()]
+    .filter((record) => record.status === "completed")
+    .toSorted((left, right) => left.updatedAt - right.updatedAt);
+  while (controllerActions.size > 200 && completed.length > 0) {
+    const record = completed.shift();
+    if (!record) {
+      break;
+    }
+    controllerActions.delete(record.actionKey);
+  }
+}
+
+export function getTaskFlowBrowserLease(): TaskFlowBrowserLeaseRecord | undefined {
+  ensureFlowRegistryReady();
+  return cloneBrowserLeaseRecord(browserLease);
+}
+
+export function acquireTaskFlowBrowserLease(params: {
+  ownerKey: string;
+  flowId: string;
+  token?: string;
+  heartbeatAt?: number;
+}):
+  | {
+      applied: true;
+      lease: TaskFlowBrowserLeaseRecord;
+    }
+  | {
+      applied: false;
+      current?: TaskFlowBrowserLeaseRecord;
+    } {
+  ensureFlowRegistryReady();
+  const now = params.heartbeatAt ?? Date.now();
+  if (browserLease && browserLease.flowId !== params.flowId) {
+    return {
+      applied: false,
+      current: cloneBrowserLeaseRecord(browserLease),
+    };
+  }
+  const next: TaskFlowBrowserLeaseRecord = browserLease
+    ? {
+        ...browserLease,
+        token: params.token?.trim() || browserLease.token,
+        heartbeatAt: now,
+        updatedAt: now,
+      }
+    : {
+        ownerKey: assertFlowOwnerKey(params.ownerKey),
+        flowId: params.flowId,
+        token: params.token?.trim() || crypto.randomUUID(),
+        epoch: (browserLease?.epoch ?? 0) + 1,
+        acquiredAt: now,
+        heartbeatAt: now,
+        updatedAt: now,
+      };
+  browserLease = next;
+  persistFlowRegistry();
+  return {
+    applied: true,
+    lease: cloneBrowserLeaseRecord(next)!,
+  };
+}
+
+export function refreshTaskFlowBrowserLease(params: {
+  flowId: string;
+  token: string;
+  heartbeatAt?: number;
+}): boolean {
+  ensureFlowRegistryReady();
+  if (
+    !browserLease ||
+    browserLease.flowId !== params.flowId ||
+    browserLease.token !== params.token
+  ) {
+    return false;
+  }
+  browserLease = {
+    ...browserLease,
+    heartbeatAt: params.heartbeatAt ?? Date.now(),
+    updatedAt: params.heartbeatAt ?? Date.now(),
+  };
+  persistFlowRegistry();
+  return true;
+}
+
+export function releaseTaskFlowBrowserLease(params: { flowId: string; token?: string }): boolean {
+  ensureFlowRegistryReady();
+  if (!browserLease || browserLease.flowId !== params.flowId) {
+    return false;
+  }
+  if (params.token && browserLease.token !== params.token) {
+    return false;
+  }
+  browserLease = undefined;
+  persistFlowRegistry();
+  return true;
+}
+
+export function clearTaskFlowBrowserLease(): void {
+  ensureFlowRegistryReady();
+  if (!browserLease) {
+    return;
+  }
+  browserLease = undefined;
+  persistFlowRegistry();
+}
+
+export function getTaskFlowControllerAction(
+  actionKey: string,
+): TaskFlowControllerActionRecord | undefined {
+  ensureFlowRegistryReady();
+  const record = controllerActions.get(actionKey);
+  return record ? cloneControllerActionRecord(record) : undefined;
+}
+
+export function beginTaskFlowControllerAction(params: {
+  actionKey: string;
+  ownerKey: string;
+  senderId?: string;
+  updateId: string;
+  normalizedAction: string;
+  kind: TaskFlowControllerActionKind;
+}): {
+  record: TaskFlowControllerActionRecord;
+  existed: boolean;
+} {
+  ensureFlowRegistryReady();
+  const existing = controllerActions.get(params.actionKey);
+  if (existing) {
+    return {
+      record: cloneControllerActionRecord(existing),
+      existed: true,
+    };
+  }
+  const now = Date.now();
+  const record: TaskFlowControllerActionRecord = {
+    actionKey: params.actionKey,
+    ownerKey: assertFlowOwnerKey(params.ownerKey),
+    senderId: normalizeText(params.senderId),
+    updateId: params.updateId.trim(),
+    normalizedAction: params.normalizedAction.trim(),
+    kind: params.kind,
+    revision: 0,
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+  };
+  controllerActions.set(record.actionKey, record);
+  pruneControllerActions();
+  persistFlowRegistry();
+  return {
+    record: cloneControllerActionRecord(record),
+    existed: false,
+  };
+}
+
+export function updateTaskFlowControllerAction(params: {
+  actionKey: string;
+  expectedRevision?: number;
+  flowId?: string | null;
+  responseText?: string | null;
+  status?: TaskFlowControllerActionRecord["status"];
+}): TaskFlowControllerActionRecord | undefined {
+  ensureFlowRegistryReady();
+  const current = controllerActions.get(params.actionKey);
+  if (!current) {
+    return undefined;
+  }
+  if (typeof params.expectedRevision === "number" && current.revision !== params.expectedRevision) {
+    return cloneControllerActionRecord(current);
+  }
+  const now = Date.now();
+  const next: TaskFlowControllerActionRecord = {
+    ...current,
+    ...(params.flowId !== undefined ? { flowId: normalizeText(params.flowId) } : {}),
+    ...(params.responseText !== undefined
+      ? { responseText: normalizeText(params.responseText) }
+      : {}),
+    ...(params.status ? { status: params.status } : {}),
+    revision: current.revision + 1,
+    updatedAt: now,
+    ...(params.status === "completed" ? { completedAt: now } : {}),
+  };
+  controllerActions.set(next.actionKey, next);
+  pruneControllerActions();
+  persistFlowRegistry();
+  return cloneControllerActionRecord(next);
+}
+
 export function resetTaskFlowRegistryForTests(opts?: { persist?: boolean }) {
   flows.clear();
+  controllerActions.clear();
+  browserLease = undefined;
   restoreAttempted = false;
   restoreFailureMessage = null;
   resetTaskFlowRegistryRuntimeForTests();

@@ -5,10 +5,16 @@ import {
   saveTaskFlowRegistryStateToSqlite,
   upsertTaskFlowRegistryRecordToSqlite,
 } from "./task-flow-registry.store.sqlite.js";
-import type { TaskFlowRecord } from "./task-flow-registry.types.js";
+import type {
+  TaskFlowBrowserLeaseRecord,
+  TaskFlowControllerActionRecord,
+  TaskFlowRecord,
+} from "./task-flow-registry.types.js";
 
 export type TaskFlowRegistryStoreSnapshot = {
   flows: Map<string, TaskFlowRecord>;
+  controllerActions: Map<string, TaskFlowControllerActionRecord>;
+  browserLease?: TaskFlowBrowserLeaseRecord;
 };
 
 export type TaskFlowRegistryStore = {

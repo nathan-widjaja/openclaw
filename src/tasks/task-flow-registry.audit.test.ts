@@ -83,6 +83,7 @@ describe("task-flow-registry audit", () => {
       store: {
         loadSnapshot: () => ({
           flows: new Map(),
+          controllerActions: new Map(),
         }),
         saveSnapshot: () => {},
       },
