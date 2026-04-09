@@ -16,6 +16,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- Telegram/live task control: move Telegram DM operator messages onto a dedicated controller lane, persist idempotent controller actions plus browser-lease ownership, suppress legacy queue-lane spam, and expose clearer `/status`, `/tasks`, and `/help` operator recovery guidance so live steering stays responsive under load.
 - Remote operator task updates now surface task IDs, progress, artifact hints, and next actions in Telegram-visible task/status replies, and audio-only mention-gated voice notes keep preflight transcription even when the local audio lane is busy.
 - Providers/Anthropic: skip `service_tier` injection for OAuth-authenticated stream wrapper requests so Claude OAuth requests stop failing with HTTP 401. (#60356) thanks @openperf.
 
