@@ -27,10 +27,11 @@ permissions: {}
 
 jobs:
   label:
+    if: github.event_name == 'pull_request_target' && github.repository != 'nathan-widjaja/openclaw'
     permissions:
       contents: read
       pull-requests: write
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ vars.OPENCLAW_CI_LINUX_RUNNER || (github.repository == 'nathan-widjaja/openclaw' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404') }}
     steps:
       - uses: actions/create-github-app-token@v2
         id: app-token
@@ -439,7 +440,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ vars.OPENCLAW_CI_LINUX_RUNNER || (github.repository == 'nathan-widjaja/openclaw' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404') }}
     steps:
       - uses: actions/create-github-app-token@v2
         id: app-token
@@ -735,9 +736,10 @@ jobs:
             core.info(`Processed ${processed} pull requests.`);
 
   label-issues:
+    if: github.event_name == 'issues'
     permissions:
       issues: write
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ vars.OPENCLAW_CI_LINUX_RUNNER || (github.repository == 'nathan-widjaja/openclaw' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404') }}
     steps:
       - uses: actions/create-github-app-token@v2
         id: app-token

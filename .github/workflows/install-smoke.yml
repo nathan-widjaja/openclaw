@@ -17,9 +17,10 @@ env:
 jobs:
   preflight:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ vars.OPENCLAW_CI_LINUX_RUNNER || (github.repository == 'nathan-widjaja/openclaw' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404') }}
     outputs:
       docs_only: ${{ steps.manifest.outputs.docs_only }}
+      workflow_only: ${{ steps.workflow_scope.outputs.workflow_only }}
       run_install_smoke: ${{ steps.manifest.outputs.run_install_smoke }}
     steps:
       - name: Checkout
@@ -39,6 +40,32 @@ jobs:
       - name: Detect docs-only changes
         id: docs_scope
         uses: ./.github/actions/detect-docs-changes
+
+      - name: Detect workflow-only changes
+        id: workflow_scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+          else
+            BASE="${{ github.event.pull_request.base.sha }}"
+          fi
+
+          workflow_only=true
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              .github/workflows/*|.github/actions/*|.github/actionlint.yaml) ;;
+              *)
+                workflow_only=false
+                break
+                ;;
+            esac
+          done < <(git diff --name-only "$BASE" HEAD)
+
+          echo "workflow_only=$workflow_only" >> "$GITHUB_OUTPUT"
 
       - name: Detect changed smoke scope
         id: changed_scope
@@ -67,13 +94,19 @@ jobs:
         id: manifest
         env:
           OPENCLAW_CI_DOCS_ONLY: ${{ steps.docs_scope.outputs.docs_only }}
+          OPENCLAW_CI_WORKFLOW_ONLY: ${{ steps.workflow_scope.outputs.workflow_only }}
           OPENCLAW_CI_RUN_CHANGED_SMOKE: ${{ steps.changed_scope.outputs.run_changed_smoke || 'false' }}
         run: |
           docs_only="${OPENCLAW_CI_DOCS_ONLY:-false}"
+          workflow_only="${OPENCLAW_CI_WORKFLOW_ONLY:-false}"
           run_changed_smoke="${OPENCLAW_CI_RUN_CHANGED_SMOKE:-false}"
           run_install_smoke=false
           if [ "$docs_only" != "true" ] && [ "$run_changed_smoke" = "true" ]; then
-            run_install_smoke=true
+            if [ "${GITHUB_REPOSITORY:-}" = "nathan-widjaja/openclaw" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] && [ "$workflow_only" = "true" ]; then
+              run_install_smoke=false
+            else
+              run_install_smoke=true
+            fi
           fi
           {
             echo "docs_only=$docs_only"
@@ -83,7 +116,7 @@ jobs:
   install-smoke:
     needs: [preflight]
     if: needs.preflight.outputs.run_install_smoke == 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ vars.OPENCLAW_CI_LINUX_RUNNER || (github.repository == 'nathan-widjaja/openclaw' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404') }}
     env:
       DOCKER_BUILD_SUMMARY: "false"
       DOCKER_BUILD_RECORD_UPLOAD: "false"
