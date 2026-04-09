@@ -49,6 +49,23 @@ import { appendUsageLine, formatResponseUsageLine } from "./agent-runner-usage-l
 import { createAudioAsVoiceBuffer, createBlockReplyPipeline } from "./block-reply-pipeline.js";
 import { resolveEffectiveBlockStreamingConfig } from "./block-streaming.js";
 import { createFollowupRunner } from "./followup-runner.js";
+import {
+  beginForegroundLiveTaskFlow,
+  buildBlockingLiveTaskReply,
+  buildDidNotQueueLiveTaskReply,
+  buildQueuedLiveTaskReply,
+  cancelLiveTaskFlow,
+  continueLiveTaskFlow,
+  createQueuedLiveTaskFlow,
+  isLiveTaskDirectMessage,
+  matchesBlockingQuestion,
+  matchesSteerContinue,
+  parseLiveTaskControlInput,
+  queueLiveTaskFlowForRetry,
+  resolveLiveTaskFlow,
+  settleLiveTaskFlow,
+  steerForegroundLiveTask,
+} from "./live-task-control.js";
 import { resolveOriginMessageProvider, resolveOriginMessageTo } from "./origin-routing.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
 import { registerQueuedFollowupLifecycle } from "./queue-lifecycle.js";
@@ -276,6 +293,71 @@ export async function runReplyAgent(params: {
     defaultModel,
     agentCfgContextTokens,
   });
+  const liveTaskDm = isLiveTaskDirectMessage(followupRun);
+  const liveTaskInput = followupRun.summaryLine?.trim() || commandBody.trim();
+  const liveTaskControl = liveTaskDm ? parseLiveTaskControlInput(liveTaskInput) : undefined;
+
+  if (liveTaskDm && matchesBlockingQuestion(liveTaskInput) && isActive) {
+    await touchActiveSessionEntry();
+    typing.cleanup();
+    return (
+      buildBlockingLiveTaskReply(queueKey) ?? {
+        text: "No managed flow is blocking right now.",
+      }
+    );
+  }
+
+  if (liveTaskDm && matchesSteerContinue(liveTaskInput) && isActive) {
+    const steered = steerForegroundLiveTask({
+      sessionKey: queueKey,
+      prompt: followupRun.prompt,
+      queueEmbeddedPiMessage: (sessionId, text) => queueEmbeddedPiMessage(sessionId, text),
+    });
+    if (steered) {
+      await touchActiveSessionEntry();
+      typing.cleanup();
+      return steered;
+    }
+  }
+
+  if (liveTaskDm && liveTaskControl) {
+    const flow = resolveLiveTaskFlow(queueKey, liveTaskControl.token);
+    if (!flow) {
+      await touchActiveSessionEntry();
+      typing.cleanup();
+      return {
+        text: `Unknown flow ${liveTaskControl.token}. Use /tasks to see the active handles.`,
+      };
+    }
+    if (liveTaskControl.action === "cancel") {
+      await touchActiveSessionEntry();
+      typing.cleanup();
+      return cancelLiveTaskFlow({
+        sessionKey: queueKey,
+        flow,
+      });
+    }
+    if (
+      liveTaskControl.action === "continue" &&
+      (flow.status === "running" || flow.status === "queued" || flow.status === "waiting")
+    ) {
+      await touchActiveSessionEntry();
+      typing.cleanup();
+      return continueLiveTaskFlow({
+        sessionKey: queueKey,
+        flow,
+      });
+    }
+    await touchActiveSessionEntry();
+    typing.cleanup();
+    return queueLiveTaskFlowForRetry({
+      sessionKey: queueKey,
+      flow,
+      template: followupRun,
+      enqueueFollowupRun: (run) =>
+        enqueueFollowupRun(queueKey, run, resolvedQueue, "prompt", queuedRunFollowupTurn, true),
+    });
+  }
 
   if (activeRunQueueAction === "drop") {
     typing.cleanup();
@@ -283,6 +365,12 @@ export async function runReplyAgent(params: {
   }
 
   if (activeRunQueueAction === "enqueue-followup") {
+    const liveTaskFlow = liveTaskDm
+      ? createQueuedLiveTaskFlow({
+          queueKey,
+          followupRun,
+        })
+      : undefined;
     const enqueued = enqueueFollowupRun(
       queueKey,
       followupRun,
@@ -292,11 +380,13 @@ export async function runReplyAgent(params: {
       false,
     );
     if (enqueued) {
-      registerQueuedFollowupLifecycle({
-        queueKey,
-        run: followupRun,
-        sendNotice: sendQueueLifecyclePayload,
-      });
+      if (!followupRun.controller?.skipQueuedLifecycle) {
+        registerQueuedFollowupLifecycle({
+          queueKey,
+          run: followupRun,
+          sendNotice: sendQueueLifecyclePayload,
+        });
+      }
     }
     // Re-check liveness after enqueue so a stale active snapshot cannot leave
     // the followup queue idle if the original run already finished.
@@ -305,6 +395,21 @@ export async function runReplyAgent(params: {
     }
     await touchActiveSessionEntry();
     typing.cleanup();
+    if (liveTaskFlow) {
+      if (!enqueued) {
+        settleLiveTaskFlow({
+          flowId: liveTaskFlow.flowId,
+          status: "cancelled",
+          blockedSummary:
+            "The flow was not queued because an equivalent request was already pending.",
+        });
+        return buildDidNotQueueLiveTaskReply(liveTaskFlow);
+      }
+      return buildQueuedLiveTaskReply({
+        queueKey,
+        flow: liveTaskFlow,
+      });
+    }
     return undefined;
   }
 
@@ -329,6 +434,26 @@ export async function runReplyAgent(params: {
     throw error;
   }
   let runFollowupTurn = queuedRunFollowupTurn;
+  const liveTaskFlow = liveTaskDm
+    ? beginForegroundLiveTaskFlow({
+        queueKey,
+        followupRun,
+      })
+    : undefined;
+  const finalizeLiveTask = (
+    payload: ReplyPayload | ReplyPayload[] | undefined,
+    status: "succeeded" | "failed" | "cancelled" | "lost",
+    blockedSummary?: string,
+  ) => {
+    if (liveTaskFlow) {
+      settleLiveTaskFlow({
+        flowId: liveTaskFlow.flowId,
+        status,
+        blockedSummary,
+      });
+    }
+    return finalizeWithFollowup(payload, queueKey, runFollowupTurn);
+  };
 
   try {
     await typingSignals.signalRunStart();
@@ -511,7 +636,7 @@ export async function runReplyAgent(params: {
       if (!replyOperation.result) {
         replyOperation.fail("run_failed", new Error("reply operation exited with final payload"));
       }
-      return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
+      return finalizeLiveTask(runOutcome.payload, "succeeded");
     }
 
     const {
@@ -622,7 +747,7 @@ export async function runReplyAgent(params: {
     // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
     // keep the typing indicator stuck.
     if (payloadArray.length === 0) {
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      return finalizeLiveTask(undefined, "succeeded");
     }
 
     const payloadResult = await buildReplyPayloads({
@@ -653,7 +778,7 @@ export async function runReplyAgent(params: {
     didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
 
     if (replyPayloads.length === 0) {
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      return finalizeLiveTask(undefined, "succeeded");
     }
 
     const successfulCronAdds = runResult.successfulCronAdds ?? 0;
@@ -857,45 +982,44 @@ export async function runReplyAgent(params: {
       finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
     }
 
-    return finalizeWithFollowup(
+    return finalizeLiveTask(
       finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
-      queueKey,
-      runFollowupTurn,
+      "succeeded",
     );
   } catch (error) {
     if (
       replyOperation.result?.kind === "aborted" &&
       replyOperation.result.code === "aborted_for_restart"
     ) {
-      return finalizeWithFollowup(
+      return finalizeLiveTask(
         { text: "⚠️ Gateway is restarting. Please wait a few seconds and try again." },
-        queueKey,
-        runFollowupTurn,
+        "lost",
+        "Gateway restarted before the flow could finish.",
       );
     }
     if (replyOperation.result?.kind === "aborted") {
-      return finalizeWithFollowup({ text: SILENT_REPLY_TOKEN }, queueKey, runFollowupTurn);
+      return finalizeLiveTask({ text: SILENT_REPLY_TOKEN }, "cancelled");
     }
     if (error instanceof GatewayDrainingError) {
       replyOperation.fail("gateway_draining", error);
-      return finalizeWithFollowup(
+      return finalizeLiveTask(
         { text: "⚠️ Gateway is restarting. Please wait a few seconds and try again." },
-        queueKey,
-        runFollowupTurn,
+        "lost",
+        "Gateway restarted before the flow could finish.",
       );
     }
     if (error instanceof CommandLaneClearedError) {
       replyOperation.fail("command_lane_cleared", error);
-      return finalizeWithFollowup(
+      return finalizeLiveTask(
         { text: "⚠️ Gateway is restarting. Please wait a few seconds and try again." },
-        queueKey,
-        runFollowupTurn,
+        "lost",
+        "Runtime lane was cleared before the flow could finish.",
       );
     }
     replyOperation.fail("run_failed", error);
     // Keep the followup queue moving even when an unexpected exception escapes
     // the run path; the caller still receives the original error.
-    finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+    finalizeLiveTask(undefined, "failed", error instanceof Error ? error.message : String(error));
     throw error;
   } finally {
     replyOperation.complete();

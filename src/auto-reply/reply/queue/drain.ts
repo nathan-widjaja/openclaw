@@ -70,6 +70,10 @@ function resolveOriginRoutingMetadata(items: FollowupRun[]): OriginRoutingMetada
 }
 
 function resolveCrossChannelKey(item: FollowupRun): { cross?: true; key?: string } {
+  if (item.controllerFlowId || item.controller?.flowId) {
+    // Controller-managed flow handles must stay one-to-one with queued items.
+    return { cross: true };
+  }
   const { originatingChannel: channel, originatingTo: to, originatingAccountId: accountId } = item;
   const threadId = item.originatingThreadId;
   if (!channel && !to && !accountId && (threadId == null || threadId === "")) {

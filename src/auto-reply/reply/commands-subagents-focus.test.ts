@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
+import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-registry.js";
 import { handleSubagentsFocusAction } from "./commands-subagents/action-focus.js";
 import { handleSubagentsUnfocusAction } from "./commands-subagents/action-unfocus.js";
 
@@ -194,6 +198,7 @@ function buildUnfocusContext(params?: { senderId?: string }) {
 describe("focus actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetTaskFlowRegistryForTests();
     hoisted.sessionBindingCapabilitiesMock.mockReturnValue(createSessionBindingCapabilities());
     hoisted.sessionBindingResolveByConversationMock.mockReturnValue(null);
     hoisted.resolveFocusTargetSessionMock.mockResolvedValue({
@@ -257,6 +262,39 @@ describe("focus actions", () => {
           channel: THREAD_CHANNEL,
           conversationId: "thread-1",
         }),
+      }),
+    );
+  });
+
+  it("keeps /focus reserved for conversation binding when live task flows exist", async () => {
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Foreground live task",
+      status: "running",
+      currentStep: "Working in the foreground conversation.",
+      stateJson: {
+        controller: {
+          foreground: true,
+          browserLease: true,
+        },
+      },
+    });
+    hoisted.resolveConversationBindingContextMock.mockReturnValue({
+      channel: THREAD_CHANNEL,
+      accountId: "default",
+      conversationId: "thread-1",
+      parentConversationId: "parent-1",
+      threadId: "thread-1",
+    });
+
+    const result = await handleSubagentsFocusAction(buildFocusContext());
+
+    expect(result.reply?.text).toContain("bound this conversation");
+    expect(hoisted.sessionBindingBindMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        placement: "current",
+        targetSessionKey: "agent:codex-acp:session-1",
       }),
     );
   });

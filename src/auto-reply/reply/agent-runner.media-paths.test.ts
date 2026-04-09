@@ -11,6 +11,7 @@ const compactEmbeddedPiSessionMock = vi.fn();
 const isEmbeddedPiRunActiveMock = vi.fn(() => false);
 const isEmbeddedPiRunStreamingMock = vi.fn(() => false);
 const queueEmbeddedPiMessageMock = vi.fn(() => false);
+const resolveActiveEmbeddedRunSessionIdMock = vi.fn(() => undefined);
 const resolveEmbeddedSessionLaneMock = vi.fn();
 const waitForEmbeddedPiRunEndMock = vi.fn();
 const enqueueFollowupRunMock = vi.fn();
@@ -35,16 +36,23 @@ vi.mock("../../agents/pi-embedded.js", () => ({
   isEmbeddedPiRunActive: isEmbeddedPiRunActiveMock,
   isEmbeddedPiRunStreaming: isEmbeddedPiRunStreamingMock,
   queueEmbeddedPiMessage: queueEmbeddedPiMessageMock,
+  resolveActiveEmbeddedRunSessionId: resolveActiveEmbeddedRunSessionIdMock,
   resolveEmbeddedSessionLane: resolveEmbeddedSessionLaneMock,
   runEmbeddedPiAgent: runEmbeddedPiAgentMock,
   waitForEmbeddedPiRunEnd: waitForEmbeddedPiRunEndMock,
 }));
 
-vi.mock("./queue.js", () => ({
-  enqueueFollowupRun: enqueueFollowupRunMock,
-  refreshQueuedFollowupSession: refreshQueuedFollowupSessionMock,
-  scheduleFollowupDrain: scheduleFollowupDrainMock,
-}));
+vi.mock("./queue.js", async () => {
+  const actual = await vi.importActual<typeof import("./queue.js")>("./queue.js");
+  return {
+    ...actual,
+    enqueueFollowupRun: enqueueFollowupRunMock,
+    refreshQueuedFollowupSession: refreshQueuedFollowupSessionMock,
+    scheduleFollowupDrain: scheduleFollowupDrainMock,
+    listFollowupQueueItems: () => [],
+    removeFollowupQueueItems: () => 0,
+  };
+});
 
 let runReplyAgent: typeof import("./agent-runner.js").runReplyAgent;
 
@@ -61,6 +69,8 @@ describe("runReplyAgent media path normalization", () => {
     isEmbeddedPiRunStreamingMock.mockReturnValue(false);
     queueEmbeddedPiMessageMock.mockReset();
     queueEmbeddedPiMessageMock.mockReturnValue(false);
+    resolveActiveEmbeddedRunSessionIdMock.mockReset();
+    resolveActiveEmbeddedRunSessionIdMock.mockReturnValue(undefined);
     resolveEmbeddedSessionLaneMock.mockReset();
     waitForEmbeddedPiRunEndMock.mockReset();
     enqueueFollowupRunMock.mockReset();

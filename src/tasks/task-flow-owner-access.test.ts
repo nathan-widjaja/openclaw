@@ -45,6 +45,12 @@ describe("task flow owner access", () => {
       })?.flowId,
     ).toBe(latest.flowId);
     expect(
+      resolveTaskFlowForLookupTokenForOwner({
+        token: "   ",
+        callerOwnerKey: "agent:main:main",
+      })?.flowId,
+    ).toBe(latest.flowId);
+    expect(
       listTaskFlowsForOwner({
         callerOwnerKey: "agent:main:main",
       }).map((flow) => flow.flowId),

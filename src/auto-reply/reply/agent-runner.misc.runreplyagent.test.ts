@@ -68,6 +68,8 @@ vi.mock("../../agents/pi-embedded.js", () => {
     queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),
     runEmbeddedPiAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
     abortEmbeddedPiRun: (...args: unknown[]) => abortEmbeddedPiRunMock(...args),
+    resolveActiveEmbeddedRunSessionId: vi.fn(() => undefined),
+    isEmbeddedPiRunActive: vi.fn(() => false),
   };
 });
 
@@ -81,12 +83,16 @@ vi.mock("../../runtime.js", () => {
   };
 });
 
-vi.mock("./queue.js", () => {
+vi.mock("./queue.js", async () => {
+  const actual = await vi.importActual<typeof import("./queue.js")>("./queue.js");
   return {
+    ...actual,
     enqueueFollowupRun: vi.fn(),
     scheduleFollowupDrain: vi.fn(),
     clearSessionQueues: (...args: unknown[]) => clearSessionQueuesMock(...args),
     refreshQueuedFollowupSession: (...args: unknown[]) => refreshQueuedFollowupSessionMock(...args),
+    listFollowupQueueItems: () => [],
+    removeFollowupQueueItems: () => 0,
   };
 });
 

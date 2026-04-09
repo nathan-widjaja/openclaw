@@ -35,6 +35,11 @@ export function getExistingFollowupQueue(key: string): FollowupQueueState | unde
   return FOLLOWUP_QUEUES.get(cleaned);
 }
 
+export function listFollowupQueueItems(key: string): FollowupRun[] {
+  const queue = getExistingFollowupQueue(key);
+  return queue ? [...queue.items] : [];
+}
+
 export function getFollowupQueue(key: string, settings: QueueSettings): FollowupQueueState {
   const existing = FOLLOWUP_QUEUES.get(key);
   if (existing) {
@@ -84,6 +89,35 @@ export function clearFollowupQueue(key: string): number {
   queue.lastEnqueuedAt = 0;
   FOLLOWUP_QUEUES.delete(cleaned);
   return cleared;
+}
+
+export function removeFollowupQueueItems(
+  key: string,
+  predicate: (item: FollowupRun) => boolean,
+): number {
+  const queue = getExistingFollowupQueue(key);
+  if (!queue) {
+    return 0;
+  }
+  const remaining: FollowupRun[] = [];
+  let removed = 0;
+  for (const item of queue.items) {
+    if (predicate(item)) {
+      removed += 1;
+      continue;
+    }
+    remaining.push(item);
+  }
+  if (removed === 0) {
+    return 0;
+  }
+  queue.items = remaining;
+  if (queue.items.length === 0 && queue.droppedCount === 0) {
+    queue.lastRun = undefined;
+    queue.lastEnqueuedAt = 0;
+    FOLLOWUP_QUEUES.delete(key.trim());
+  }
+  return removed;
 }
 
 export function refreshQueuedFollowupSession(params: {

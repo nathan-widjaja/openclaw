@@ -39,6 +39,7 @@ import type { ElevatedLevel, ReasoningLevel, ThinkLevel, VerboseLevel } from "..
 import type { ReplyPayload } from "../types.js";
 import { buildSubagentsStatusLine } from "./commands-status-subagents.js";
 import type { CommandContext } from "./commands-types.js";
+import { buildLiveTaskStatusLine } from "./live-task-control.js";
 import { getFollowupQueueDepth, resolveQueueSettings } from "./queue.js";
 
 // Some usage endpoints only work with CLI/session OAuth tokens, not API keys.
@@ -60,6 +61,10 @@ function shouldLoadUsageSummary(params: {
 }
 
 function formatSessionTaskLine(sessionKey: string): string | undefined {
+  const liveTaskLine = buildLiveTaskStatusLine(sessionKey);
+  if (liveTaskLine) {
+    return liveTaskLine;
+  }
   const snapshot = buildTaskStatusSnapshot(listTasksForSessionKeyForStatus(sessionKey));
   const task = snapshot.focus;
   if (!task) {
