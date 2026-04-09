@@ -5,6 +5,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import type { SessionEntry } from "../../config/sessions.js";
 import * as sessions from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
+import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-registry.js";
 import { withStateDirEnv } from "../../test-helpers/state-dir-env.js";
 import type { TemplateContext } from "../templating.js";
 import type { GetReplyOptions } from "../types.js";
@@ -41,6 +45,10 @@ type EmbeddedRunParams = {
 
 const state = vi.hoisted(() => ({
   compactEmbeddedPiSessionMock: vi.fn(),
+  isEmbeddedPiRunActiveMock: vi.fn(() => false),
+  queueEmbeddedPiMessageMock: vi.fn(() => false),
+  registerQueuedFollowupLifecycleMock: vi.fn(),
+  resolveActiveEmbeddedRunSessionIdMock: vi.fn(() => undefined),
   runEmbeddedPiAgentMock: vi.fn(),
 }));
 
@@ -81,15 +89,29 @@ vi.mock("../../agents/model-fallback.js", () => ({
 
 vi.mock("../../agents/pi-embedded.js", () => ({
   compactEmbeddedPiSession: (params: unknown) => state.compactEmbeddedPiSessionMock(params),
-  queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),
+  isEmbeddedPiRunActive: (...args: unknown[]) => state.isEmbeddedPiRunActiveMock(...args),
+  queueEmbeddedPiMessage: (...args: unknown[]) => state.queueEmbeddedPiMessageMock(...args),
+  resolveActiveEmbeddedRunSessionId: (...args: unknown[]) =>
+    state.resolveActiveEmbeddedRunSessionIdMock(...args),
   runEmbeddedPiAgent: (params: unknown) => state.runEmbeddedPiAgentMock(params),
 }));
 
-vi.mock("./queue.js", () => ({
-  enqueueFollowupRun: vi.fn(),
-  refreshQueuedFollowupSession: vi.fn(),
-  scheduleFollowupDrain: vi.fn(),
+vi.mock("./queue-lifecycle.js", () => ({
+  registerQueuedFollowupLifecycle: (...args: unknown[]) =>
+    state.registerQueuedFollowupLifecycleMock(...args),
 }));
+
+vi.mock("./queue.js", async () => {
+  const actual = await vi.importActual<typeof import("./queue.js")>("./queue.js");
+  return {
+    ...actual,
+    enqueueFollowupRun: vi.fn(),
+    refreshQueuedFollowupSession: vi.fn(),
+    scheduleFollowupDrain: vi.fn(),
+    listFollowupQueueItems: () => [],
+    removeFollowupQueueItems: () => 0,
+  };
+});
 
 beforeAll(async () => {
   // Avoid attributing the initial agent-runner import cost to the first test case.
@@ -99,7 +121,15 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  resetTaskFlowRegistryForTests();
   state.compactEmbeddedPiSessionMock.mockClear();
+  state.isEmbeddedPiRunActiveMock.mockReset();
+  state.isEmbeddedPiRunActiveMock.mockReturnValue(false);
+  state.queueEmbeddedPiMessageMock.mockReset();
+  state.queueEmbeddedPiMessageMock.mockReturnValue(false);
+  state.registerQueuedFollowupLifecycleMock.mockReset();
+  state.resolveActiveEmbeddedRunSessionIdMock.mockReset();
+  state.resolveActiveEmbeddedRunSessionIdMock.mockReturnValue(undefined);
   state.runEmbeddedPiAgentMock.mockClear();
   vi.mocked(enqueueFollowupRun).mockClear();
   vi.mocked(refreshQueuedFollowupSession).mockClear();
@@ -112,6 +142,7 @@ function createMinimalRun(params?: {
   resolvedVerboseLevel?: "off" | "on";
   sessionStore?: Record<string, SessionEntry>;
   sessionEntry?: SessionEntry;
+  queueKey?: string;
   sessionKey?: string;
   storePath?: string;
   typingMode?: TypingMode;
@@ -120,6 +151,7 @@ function createMinimalRun(params?: {
   isRunActive?: () => boolean;
   shouldFollowup?: boolean;
   resolvedQueueMode?: string;
+  followupOverrides?: Partial<Omit<FollowupRun, "run">>;
   runOverrides?: Partial<FollowupRun["run"]>;
 }) {
   const typing = createMockTypingController();
@@ -132,10 +164,12 @@ function createMinimalRun(params?: {
     mode: params?.resolvedQueueMode ?? "interrupt",
   } as unknown as QueueSettings;
   const sessionKey = params?.sessionKey ?? "main";
+  const queueKey = params?.queueKey ?? sessionKey;
   const followupRun = {
     prompt: "hello",
     summaryLine: "hello",
     enqueuedAt: Date.now(),
+    ...params?.followupOverrides,
     run: {
       sessionId: "session",
       sessionKey,
@@ -168,7 +202,7 @@ function createMinimalRun(params?: {
       return runReplyAgent({
         commandBody: "hello",
         followupRun,
-        queueKey: "main",
+        queueKey,
         resolvedQueue,
         shouldSteer: false,
         shouldFollowup: params?.shouldFollowup ?? false,
@@ -191,6 +225,16 @@ function createMinimalRun(params?: {
         typingMode: params?.typingMode ?? "instant",
       });
     },
+  };
+}
+
+function createTelegramDirectFollowup(text: string): Partial<Omit<FollowupRun, "run">> {
+  return {
+    prompt: text,
+    summaryLine: text,
+    originatingChannel: "telegram",
+    originatingTo: "12345",
+    originatingChatType: "private",
   };
 }
 
@@ -365,6 +409,146 @@ describe("runReplyAgent heartbeat followup guard", () => {
     } finally {
       persistSpy.mockRestore();
     }
+  });
+});
+
+describe("runReplyAgent live task controller", () => {
+  it("returns a managed flow ack for a second Telegram DM and bypasses queued lifecycle notices", async () => {
+    const { run } = createMinimalRun({
+      isActive: true,
+      shouldFollowup: true,
+      resolvedQueueMode: "collect",
+      sessionKey: "agent:main:main",
+      queueKey: "agent:main:main",
+      followupOverrides: createTelegramDirectFollowup("Draft the next replies now"),
+      runOverrides: {
+        messageProvider: "telegram",
+      },
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("Queued as flow"),
+    });
+    expect((result as { text?: string } | undefined)?.text).not.toContain(
+      "Queued behind earlier work",
+    );
+    expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);
+    expect(state.registerQueuedFollowupLifecycleMock).not.toHaveBeenCalled();
+  });
+
+  it("answers blocking questions immediately for an active Telegram DM", async () => {
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Keep replying while the browser is warm",
+      status: "running",
+      currentStep: "Working in the foreground conversation.",
+      stateJson: {
+        controller: {
+          foreground: true,
+          browserLease: true,
+        },
+        request: {
+          prompt: "Keep replying while the browser is warm",
+          summaryLine: "Keep replying while the browser is warm",
+          waitKind: "browser_lease",
+        },
+      },
+    });
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Review the next thread",
+      status: "waiting",
+      currentStep: "Waiting for the foreground flow to clear.",
+      waitJson: {
+        kind: "browser_lease",
+        heldByFlowId: "held-flow-id",
+        heldByHandle: "heldflow",
+        queuePosition: 1,
+      },
+      stateJson: {
+        controller: {
+          foreground: false,
+          browserLease: false,
+        },
+        request: {
+          prompt: "Review the next thread",
+          summaryLine: "Review the next thread",
+          waitKind: "browser_lease",
+        },
+      },
+    });
+
+    const { run } = createMinimalRun({
+      isActive: true,
+      shouldFollowup: true,
+      resolvedQueueMode: "collect",
+      sessionKey: "agent:main:main",
+      queueKey: "agent:main:main",
+      followupOverrides: createTelegramDirectFollowup("How to clear the lane? What's blocking?"),
+      runOverrides: {
+        messageProvider: "telegram",
+      },
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("Foreground flow"),
+    });
+    expect((result as { text?: string } | undefined)?.text).toContain("Next waiting flow");
+    expect(vi.mocked(enqueueFollowupRun)).not.toHaveBeenCalled();
+  });
+
+  it("steers the foreground Telegram DM when asked to continue while the browser is warm", async () => {
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Reply to the current thread",
+      status: "running",
+      currentStep: "Working in the foreground conversation.",
+      stateJson: {
+        controller: {
+          foreground: true,
+          browserLease: true,
+        },
+        request: {
+          prompt: "Reply to the current thread",
+          summaryLine: "Reply to the current thread",
+          waitKind: "browser_lease",
+        },
+      },
+    });
+    state.resolveActiveEmbeddedRunSessionIdMock.mockReturnValue("pi-session-1");
+    state.queueEmbeddedPiMessageMock.mockReturnValue(true);
+
+    const { run } = createMinimalRun({
+      isActive: true,
+      shouldFollowup: true,
+      resolvedQueueMode: "collect",
+      sessionKey: "agent:main:main",
+      queueKey: "agent:main:main",
+      followupOverrides: createTelegramDirectFollowup(
+        "Yes continue replies now while the browser state is warm",
+      ),
+      runOverrides: {
+        messageProvider: "telegram",
+      },
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({
+      text: expect.stringContaining("Steered foreground flow"),
+    });
+    expect(state.queueEmbeddedPiMessageMock).toHaveBeenCalledWith(
+      "pi-session-1",
+      "Yes continue replies now while the browser state is warm",
+    );
+    expect(vi.mocked(enqueueFollowupRun)).not.toHaveBeenCalled();
   });
 });
 

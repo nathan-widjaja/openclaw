@@ -26,10 +26,16 @@ vi.mock("../group-activation.js", () => ({
   normalizeGroupActivation: (value: unknown) => value,
 }));
 
-vi.mock("./queue.js", () => ({
-  getFollowupQueueDepth: () => 0,
-  resolveQueueSettings: () => ({ mode: "interrupt" }),
-}));
+vi.mock("./queue.js", async () => {
+  const actual = await vi.importActual<typeof import("./queue.js")>("./queue.js");
+  return {
+    ...actual,
+    getFollowupQueueDepth: () => 0,
+    resolveQueueSettings: () => ({ mode: "interrupt" }),
+    listFollowupQueueItems: () => [],
+    removeFollowupQueueItems: () => 0,
+  };
+});
 
 const { buildStatusReply } = await import("./commands-status.js");
 

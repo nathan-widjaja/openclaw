@@ -33,6 +33,14 @@ export type FollowupRun = {
   messageId?: string;
   summaryLine?: string;
   enqueuedAt: number;
+  /** Managed flow handle used by the live task controller. */
+  controllerFlowId?: string;
+  /** Immediate controller ack returned instead of queued-lifecycle lane notices. */
+  controllerAckText?: string;
+  /** Skip the legacy queued-followup notice lifecycle for controller-managed items. */
+  controllerBypassQueueLifecycle?: boolean;
+  /** Preserve a warm browser lease hint on the foreground flow. */
+  controllerBrowserLease?: boolean;
   /**
    * Original queued items represented by this run when the drain synthesizes a
    * summary or collect prompt.
@@ -55,6 +63,11 @@ export type FollowupRun = {
   originatingThreadId?: string | number;
   /** Chat type for context-aware threading (e.g., DM vs channel). */
   originatingChatType?: string;
+  controller?: {
+    flowId?: string;
+    waitKind?: "capacity" | "browser_lease";
+    skipQueuedLifecycle?: boolean;
+  };
   run: {
     agentId: string;
     agentDir: string;

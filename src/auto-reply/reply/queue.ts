@@ -8,7 +8,12 @@ export {
   resetRecentQueuedMessageIdDedupe,
 } from "./queue/enqueue.js";
 export { resolveQueueSettings } from "./queue/settings.js";
-export { clearFollowupQueue, refreshQueuedFollowupSession } from "./queue/state.js";
+export {
+  clearFollowupQueue,
+  listFollowupQueueItems,
+  refreshQueuedFollowupSession,
+  removeFollowupQueueItems,
+} from "./queue/state.js";
 export type {
   FollowupLifecycleRef,
   FollowupRun,

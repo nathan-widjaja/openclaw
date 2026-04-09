@@ -14,6 +14,10 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/task-executor.js";
+import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-registry.js";
 import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import { buildStatusReply, buildStatusText } from "./commands-status.js";
 import { buildCommandTestParams } from "./commands.test-harness.js";
@@ -88,11 +92,40 @@ describe("buildStatusReply subagent summary", () => {
   beforeEach(() => {
     resetSubagentRegistryForTests();
     resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests();
   });
 
   afterEach(() => {
     resetSubagentRegistryForTests();
     resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests();
+  });
+
+  it("prefers the live task controller summary when a managed foreground flow exists", async () => {
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Reply to the X thread while the browser is warm",
+      status: "running",
+      currentStep: "Working in the foreground conversation.",
+      stateJson: {
+        controller: {
+          foreground: true,
+          browserLease: true,
+        },
+        request: {
+          prompt: "reply to the X thread while the browser is warm",
+          summaryLine: "reply to the X thread while the browser is warm",
+          waitKind: "browser_lease",
+        },
+      },
+    });
+
+    const reply = await buildStatusReplyForTest({});
+
+    expect(reply?.text).toContain("📌 Tasks: foreground");
+    expect(reply?.text).toContain("Reply to the X thread while the browser is warm");
+    expect(reply?.text).toContain("Working in the foreground conversation.");
   });
 
   it("counts ended orchestrators with active descendants as active", async () => {

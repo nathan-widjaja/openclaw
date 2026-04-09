@@ -1,0 +1,1000 @@
+import { abortEmbeddedPiRun, resolveActiveEmbeddedRunSessionId } from "../../agents/pi-embedded.js";
+import { formatTimeAgo } from "../../infra/format-time/format-relative.ts";
+import { listTasksForFlowId } from "../../tasks/runtime-internal.js";
+import {
+  getTaskFlowByIdForOwner,
+  listTaskFlowsForOwner,
+  resolveTaskFlowForLookupTokenForOwner,
+} from "../../tasks/task-flow-owner-access.js";
+import {
+  createManagedTaskFlow,
+  getTaskFlowById,
+  updateFlowRecordByIdExpectedRevision,
+} from "../../tasks/task-flow-registry.js";
+import type { JsonValue, TaskFlowRecord } from "../../tasks/task-flow-registry.types.js";
+import { sanitizeTaskStatusText } from "../../tasks/task-status.js";
+import { listFollowupQueueItems, removeFollowupQueueItems, type FollowupRun } from "./queue.js";
+import { replyRunRegistry } from "./reply-run-registry.js";
+
+const LIVE_TASK_CONTROLLER_ID = "auto-reply/live-task-control";
+const LIVE_TASK_HANDLE_MAX_CHARS = 8;
+const ACTIVE_FLOW_STATUSES = new Set(["queued", "running", "waiting", "blocked"]);
+const TERMINAL_FLOW_STATUSES = new Set(["succeeded", "failed", "cancelled", "lost"]);
+
+type LiveTaskWaitKind = "capacity" | "browser_lease";
+
+type ControllerState = {
+  foreground?: boolean;
+  browserLease?: boolean;
+};
+
+type RequestState = {
+  prompt?: string;
+  summaryLine?: string;
+  waitKind?: LiveTaskWaitKind;
+};
+
+type RuntimeState = {
+  inlineActive?: boolean;
+};
+
+type LiveTaskFlowState = {
+  controller: ControllerState;
+  request?: RequestState;
+  runtime?: RuntimeState;
+};
+
+type FlowWaitJson = {
+  kind: LiveTaskWaitKind;
+  heldByFlowId?: string;
+  heldByHandle?: string;
+  queuePosition?: number;
+};
+
+export type LiveTaskBoard = {
+  all: TaskFlowRecord[];
+  foreground?: TaskFlowRecord;
+  browserHolder?: TaskFlowRecord;
+  blocked: TaskFlowRecord[];
+  waiting: TaskFlowRecord[];
+  recent: TaskFlowRecord[];
+};
+
+function sanitizeFlowText(value: unknown, maxChars?: number): string {
+  return sanitizeTaskStatusText(value, maxChars == null ? undefined : { maxChars });
+}
+
+function isManagedLiveTaskFlow(flow: TaskFlowRecord): boolean {
+  return flow.syncMode === "managed" && flow.controllerId === LIVE_TASK_CONTROLLER_ID;
+}
+
+function isActiveFlow(flow: TaskFlowRecord): boolean {
+  return ACTIVE_FLOW_STATUSES.has(flow.status);
+}
+
+function isTerminalFlow(flow: TaskFlowRecord): boolean {
+  return TERMINAL_FLOW_STATUSES.has(flow.status);
+}
+
+function normalizeControllerStateJson(stateJson: JsonValue | undefined): LiveTaskFlowState {
+  if (!stateJson || typeof stateJson !== "object" || Array.isArray(stateJson)) {
+    return { controller: {} };
+  }
+  const root = stateJson as Record<string, unknown>;
+  const controllerRoot =
+    root.controller && typeof root.controller === "object" && !Array.isArray(root.controller)
+      ? (root.controller as Record<string, unknown>)
+      : {};
+  const requestRoot =
+    root.request && typeof root.request === "object" && !Array.isArray(root.request)
+      ? (root.request as Record<string, unknown>)
+      : undefined;
+  const runtimeRoot =
+    root.runtime && typeof root.runtime === "object" && !Array.isArray(root.runtime)
+      ? (root.runtime as Record<string, unknown>)
+      : undefined;
+  return {
+    controller: {
+      foreground: controllerRoot.foreground === true,
+      browserLease: controllerRoot.browserLease === true,
+    },
+    ...(requestRoot
+      ? {
+          request: {
+            prompt:
+              typeof requestRoot.prompt === "string" && requestRoot.prompt.trim()
+                ? requestRoot.prompt
+                : undefined,
+            summaryLine:
+              typeof requestRoot.summaryLine === "string" && requestRoot.summaryLine.trim()
+                ? requestRoot.summaryLine
+                : undefined,
+            waitKind:
+              requestRoot.waitKind === "browser_lease" || requestRoot.waitKind === "capacity"
+                ? requestRoot.waitKind
+                : undefined,
+          },
+        }
+      : {}),
+    ...(runtimeRoot
+      ? {
+          runtime: {
+            inlineActive: runtimeRoot.inlineActive === true,
+          },
+        }
+      : {}),
+  };
+}
+
+function buildStateJson(params: {
+  flow?: TaskFlowRecord;
+  controller?: Partial<ControllerState>;
+  request?: Partial<RequestState>;
+  runtime?: Partial<RuntimeState>;
+}): JsonValue {
+  const current = params.flow
+    ? normalizeControllerStateJson(params.flow.stateJson)
+    : { controller: {} };
+  const controller: ControllerState = {
+    foreground: params.controller?.foreground ?? current.controller.foreground ?? false,
+    browserLease: params.controller?.browserLease ?? current.controller.browserLease ?? false,
+  };
+  const requestCurrent = current.request ?? {};
+  const request: RequestState = {
+    prompt: params.request?.prompt ?? requestCurrent.prompt,
+    summaryLine: params.request?.summaryLine ?? requestCurrent.summaryLine,
+    waitKind: params.request?.waitKind ?? requestCurrent.waitKind,
+  };
+  const requestJson = {
+    ...(request.prompt ? { prompt: request.prompt } : {}),
+    ...(request.summaryLine ? { summaryLine: request.summaryLine } : {}),
+    ...(request.waitKind ? { waitKind: request.waitKind } : {}),
+  };
+  const runtimeCurrent = current.runtime ?? {};
+  const runtime: RuntimeState = {
+    inlineActive: params.runtime?.inlineActive ?? runtimeCurrent.inlineActive ?? false,
+  };
+  const runtimeJson = runtime.inlineActive ? { inlineActive: true } : {};
+  return {
+    controller,
+    ...(Object.keys(requestJson).length > 0 ? { request: requestJson } : {}),
+    ...(Object.keys(runtimeJson).length > 0 ? { runtime: runtimeJson } : {}),
+  };
+}
+
+function updateManagedFlow(
+  flowId: string,
+  mutator: (flow: TaskFlowRecord) => Record<string, unknown>,
+): TaskFlowRecord | undefined {
+  let current = getTaskFlowById(flowId);
+  if (!current || !isManagedLiveTaskFlow(current)) {
+    return current;
+  }
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = updateFlowRecordByIdExpectedRevision({
+      flowId: current.flowId,
+      expectedRevision: current.revision,
+      patch: mutator(current),
+    });
+    if (result.applied) {
+      return result.flow;
+    }
+    if (result.reason !== "revision_conflict" || !result.current) {
+      return result.current ?? undefined;
+    }
+    current = result.current;
+  }
+  return current;
+}
+
+function clearManagedFlowMarkers(params: {
+  ownerKey: string;
+  keepFlowId?: string;
+  clearForeground?: boolean;
+  clearBrowserLease?: boolean;
+  clearInlineRuntime?: boolean;
+}): void {
+  for (const flow of listTaskFlowsForOwner({ callerOwnerKey: params.ownerKey })) {
+    if (!isManagedLiveTaskFlow(flow) || flow.flowId === params.keepFlowId) {
+      continue;
+    }
+    const state = normalizeControllerStateJson(flow.stateJson);
+    const nextForeground = params.clearForeground ? false : state.controller.foreground;
+    const nextBrowserLease = params.clearBrowserLease ? false : state.controller.browserLease;
+    const nextInlineRuntime = params.clearInlineRuntime ? false : state.runtime?.inlineActive;
+    if (
+      nextForeground === state.controller.foreground &&
+      nextBrowserLease === state.controller.browserLease &&
+      nextInlineRuntime === state.runtime?.inlineActive
+    ) {
+      continue;
+    }
+    updateManagedFlow(flow.flowId, (current) => ({
+      stateJson: buildStateJson({
+        flow: current,
+        controller: {
+          foreground: nextForeground,
+          browserLease: nextBrowserLease,
+        },
+        runtime: {
+          inlineActive: nextInlineRuntime,
+        },
+      }),
+    }));
+  }
+}
+
+function summarizeGoal(run: FollowupRun): string {
+  return sanitizeFlowText(run.summaryLine, 96) || sanitizeFlowText(run.prompt, 96) || "Live task";
+}
+
+export function formatLiveTaskHandle(flow: Pick<TaskFlowRecord, "flowId">): string {
+  return sanitizeFlowText(flow.flowId, LIVE_TASK_HANDLE_MAX_CHARS) || flow.flowId.slice(0, 8);
+}
+
+function applyControllerMetadata(
+  run: FollowupRun,
+  params: {
+    flowId: string;
+    waitKind: LiveTaskWaitKind;
+    skipQueuedLifecycle?: boolean;
+    browserLease?: boolean;
+  },
+): FollowupRun {
+  run.controllerFlowId = params.flowId;
+  run.controllerAckText = undefined;
+  run.controllerBypassQueueLifecycle = params.skipQueuedLifecycle === true;
+  run.controllerBrowserLease = params.browserLease === true;
+  run.controller = {
+    flowId: params.flowId,
+    waitKind: params.waitKind,
+    skipQueuedLifecycle: params.skipQueuedLifecycle === true,
+  };
+  return run;
+}
+
+function buildWaitJson(params: {
+  kind: LiveTaskWaitKind;
+  heldByFlowId?: string;
+  queuePosition?: number;
+}): FlowWaitJson {
+  return {
+    kind: params.kind,
+    ...(params.heldByFlowId ? { heldByFlowId: params.heldByFlowId } : {}),
+    ...(params.heldByFlowId
+      ? { heldByHandle: formatLiveTaskHandle({ flowId: params.heldByFlowId }) }
+      : {}),
+    ...(typeof params.queuePosition === "number" ? { queuePosition: params.queuePosition } : {}),
+  };
+}
+
+function waitKindFromText(text: string): LiveTaskWaitKind {
+  return /\b(browser|warm|tab|page|site|click|reply)\b/i.test(text) ? "browser_lease" : "capacity";
+}
+
+function getForegroundFlowForOwner(ownerKey: string): TaskFlowRecord | undefined {
+  return listTaskFlowsForOwner({ callerOwnerKey: ownerKey })
+    .filter((flow) => isManagedLiveTaskFlow(flow) && isActiveFlow(flow))
+    .find((flow) => normalizeControllerStateJson(flow.stateJson).controller.foreground);
+}
+
+function queuePositionForFlow(ownerKey: string, flowId: string): number | undefined {
+  const items = listFollowupQueueItems(ownerKey);
+  const index = items.findIndex((item) => item.controller?.flowId === flowId);
+  return index >= 0 ? index + 1 : undefined;
+}
+
+function hasQueuedRunForFlow(ownerKey: string, flowId: string): boolean {
+  return listFollowupQueueItems(ownerKey).some((item) => item.controller?.flowId === flowId);
+}
+
+function hasActiveLinkedTasks(flowId: string): boolean {
+  return listTasksForFlowId(flowId).some(
+    (task) => task.status === "queued" || task.status === "running",
+  );
+}
+
+function extractQueuePosition(flow: TaskFlowRecord): number | undefined {
+  if (!flow.waitJson || typeof flow.waitJson !== "object" || Array.isArray(flow.waitJson)) {
+    return undefined;
+  }
+  const queuePosition = (flow.waitJson as Record<string, unknown>).queuePosition;
+  return typeof queuePosition === "number" && Number.isFinite(queuePosition)
+    ? queuePosition
+    : undefined;
+}
+
+function reconcileFlow(flow: TaskFlowRecord, now = Date.now()): TaskFlowRecord {
+  if (!isManagedLiveTaskFlow(flow) || isTerminalFlow(flow)) {
+    return flow;
+  }
+  if (flow.status === "blocked") {
+    return flow;
+  }
+  const state = normalizeControllerStateJson(flow.stateJson);
+  const activeReplyRun = replyRunRegistry.isActive(flow.ownerKey);
+  const hasInlineRuntime = state.runtime?.inlineActive === true && activeReplyRun;
+  const hasLegacyInlineRuntime =
+    flow.status === "running" &&
+    activeReplyRun &&
+    (state.controller.foreground || state.controller.browserLease);
+  const hasLinkedTasks = hasActiveLinkedTasks(flow.flowId);
+  const queued = hasQueuedRunForFlow(flow.ownerKey, flow.flowId);
+  if (!hasInlineRuntime && !hasLegacyInlineRuntime && !hasLinkedTasks && !queued) {
+    return {
+      ...flow,
+      status: "lost",
+      blockedSummary: flow.blockedSummary ?? "Runtime disappeared before the flow finished.",
+      waitJson: null,
+      updatedAt: now,
+      endedAt: flow.endedAt ?? now,
+    };
+  }
+  if (
+    flow.status === "waiting" &&
+    flow.waitJson &&
+    typeof flow.waitJson === "object" &&
+    !Array.isArray(flow.waitJson)
+  ) {
+    const wait = flow.waitJson as Record<string, unknown>;
+    const position = queuePositionForFlow(flow.ownerKey, flow.flowId);
+    return {
+      ...flow,
+      waitJson: {
+        ...wait,
+        ...(typeof position === "number" ? { queuePosition: position } : {}),
+      },
+    };
+  }
+  return flow;
+}
+
+function formatWaitSummary(flow: TaskFlowRecord): string | undefined {
+  if (!flow.waitJson || typeof flow.waitJson !== "object" || Array.isArray(flow.waitJson)) {
+    return undefined;
+  }
+  const wait = flow.waitJson as Record<string, unknown>;
+  const heldBy = typeof wait.heldByHandle === "string" ? wait.heldByHandle : undefined;
+  const queuePosition =
+    typeof wait.queuePosition === "number" && Number.isFinite(wait.queuePosition)
+      ? wait.queuePosition
+      : undefined;
+  if (wait.kind === "browser_lease") {
+    const reason = heldBy
+      ? `Browser lease held by flow ${heldBy}.`
+      : "Waiting for the active browser lease to clear.";
+    return queuePosition ? `${reason} Queue position ${queuePosition}.` : reason;
+  }
+  if (wait.kind === "capacity") {
+    const reason = heldBy
+      ? `Queued behind foreground flow ${heldBy}.`
+      : "Queued behind foreground capacity.";
+    return queuePosition ? `${reason} Queue position ${queuePosition}.` : reason;
+  }
+  return undefined;
+}
+
+export function formatLiveTaskState(flow: TaskFlowRecord): string {
+  if (flow.status === "blocked") {
+    return sanitizeFlowText(flow.blockedSummary, 180) || "Blocked waiting for input.";
+  }
+  if (flow.status === "waiting") {
+    return formatWaitSummary(flow) ?? "Waiting for the foreground flow to clear.";
+  }
+  if (flow.status === "running") {
+    return sanitizeFlowText(flow.currentStep, 180) || "Working now.";
+  }
+  if (flow.status === "queued") {
+    return sanitizeFlowText(flow.currentStep, 180) || "Queued to start.";
+  }
+  if (flow.status === "lost") {
+    return "Runtime disappeared before the flow finished.";
+  }
+  if (flow.status === "failed") {
+    return sanitizeFlowText(flow.blockedSummary, 180) || "Flow failed.";
+  }
+  if (flow.status === "cancelled") {
+    return "Flow was cancelled.";
+  }
+  return "Completed.";
+}
+
+export function formatLiveTaskNextPhrases(flow: TaskFlowRecord): string[] {
+  const handle = formatLiveTaskHandle(flow);
+  const phrases = [`/tasks ${handle}`];
+  if (flow.status === "waiting" || flow.status === "blocked") {
+    phrases.unshift(`continue ${handle}`, `cancel ${handle}`);
+    return phrases;
+  }
+  if (flow.status === "running" || flow.status === "queued") {
+    phrases.unshift(`cancel ${handle}`);
+    return phrases;
+  }
+  if (flow.status === "failed" || flow.status === "cancelled" || flow.status === "lost") {
+    phrases.unshift(`retry ${handle}`);
+    return phrases;
+  }
+  return phrases;
+}
+
+export function resolveLiveTaskBoard(sessionKey: string): LiveTaskBoard {
+  const flows = listTaskFlowsForOwner({ callerOwnerKey: sessionKey })
+    .filter(isManagedLiveTaskFlow)
+    .map((flow) => reconcileFlow(flow))
+    .toSorted((left, right) => right.createdAt - left.createdAt);
+  const foreground = flows.find(
+    (flow) => normalizeControllerStateJson(flow.stateJson).controller.foreground,
+  );
+  const browserHolder =
+    flows.find((flow) => normalizeControllerStateJson(flow.stateJson).controller.browserLease) ??
+    foreground;
+  const waiting = flows
+    .filter((flow) => flow.status === "waiting")
+    .toSorted((left, right) => {
+      const leftPosition = extractQueuePosition(left);
+      const rightPosition = extractQueuePosition(right);
+      if (leftPosition == null && rightPosition == null) {
+        return left.createdAt - right.createdAt;
+      }
+      if (leftPosition == null) {
+        return 1;
+      }
+      if (rightPosition == null) {
+        return -1;
+      }
+      return leftPosition === rightPosition
+        ? left.createdAt - right.createdAt
+        : leftPosition - rightPosition;
+    });
+  return {
+    all: flows,
+    foreground,
+    browserHolder,
+    blocked: flows.filter((flow) => flow.status === "blocked"),
+    waiting,
+    recent: flows.filter((flow) => isTerminalFlow(flow)).slice(0, 5),
+  };
+}
+
+function formatFlowHeadline(flow: TaskFlowRecord): string {
+  return `${formatLiveTaskHandle(flow)} · ${sanitizeFlowText(flow.goal, 96) || "Live task"}`;
+}
+
+export function buildLiveTaskBoardText(params: {
+  sessionKey: string;
+  lookup?: string;
+}): string | undefined {
+  if (params.lookup) {
+    const flow = resolveLiveTaskFlow(params.sessionKey, params.lookup);
+    if (!flow) {
+      return `Unknown flow: ${params.lookup}`;
+    }
+    const reconciled = reconcileFlow(flow);
+    const tasks = listTasksForFlowId(reconciled.flowId);
+    const lines = [
+      `📋 Flow ${formatLiveTaskHandle(reconciled)}`,
+      `Goal: ${sanitizeFlowText(reconciled.goal, 180) || "Live task"}`,
+      `Status: ${reconciled.status.replaceAll("_", " ")}`,
+      `State: ${formatLiveTaskState(reconciled)}`,
+      `Updated: ${formatTimeAgo(Date.now() - reconciled.updatedAt)}`,
+      `Next: ${formatLiveTaskNextPhrases(reconciled).join(" · ")}`,
+    ];
+    if (tasks.length > 0) {
+      lines.push("", `Attempts: ${tasks.length}`);
+    }
+    return lines.join("\n");
+  }
+
+  const board = resolveLiveTaskBoard(params.sessionKey);
+  if (board.all.length === 0) {
+    return undefined;
+  }
+  const lines = ["📋 Tasks"];
+  if (board.foreground) {
+    lines.push(`Foreground: ${formatFlowHeadline(board.foreground)}`);
+    lines.push(`State: ${formatLiveTaskState(board.foreground)}`);
+    lines.push(`Next: ${formatLiveTaskNextPhrases(board.foreground).join(" · ")}`);
+  }
+  if (board.browserHolder) {
+    lines.push("", `Browser holder: ${formatFlowHeadline(board.browserHolder)}`);
+  }
+  if (board.blocked.length > 0) {
+    lines.push("", "Blocked:");
+    for (const [index, flow] of board.blocked.entries()) {
+      lines.push(`${index + 1}. ${formatFlowHeadline(flow)}`);
+      lines.push(`   ${formatLiveTaskState(flow)}`);
+      lines.push(`   Next: ${formatLiveTaskNextPhrases(flow).join(" · ")}`);
+    }
+  }
+  if (board.waiting.length > 0) {
+    lines.push("", "Waiting:");
+    for (const [index, flow] of board.waiting.entries()) {
+      lines.push(`${index + 1}. ${formatFlowHeadline(flow)}`);
+      lines.push(`   ${formatLiveTaskState(flow)}`);
+      lines.push(`   Next: ${formatLiveTaskNextPhrases(flow).join(" · ")}`);
+    }
+  }
+  if (board.recent.length > 0) {
+    lines.push("", "Recent:");
+    for (const [index, flow] of board.recent.entries()) {
+      lines.push(`${index + 1}. ${formatFlowHeadline(flow)}`);
+      lines.push(
+        `   ${flow.status.replaceAll("_", " ")} · ${formatTimeAgo(Date.now() - (flow.endedAt ?? flow.updatedAt))}`,
+      );
+      lines.push(`   Next: ${formatLiveTaskNextPhrases(flow).join(" · ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function buildLiveTaskStatusLine(sessionKey: string): string | undefined {
+  const board = resolveLiveTaskBoard(sessionKey);
+  if (board.all.length === 0) {
+    return undefined;
+  }
+  if (board.foreground) {
+    return `📌 Tasks: foreground ${formatFlowHeadline(board.foreground)} · ${formatLiveTaskState(board.foreground)}`;
+  }
+  if (board.blocked.length > 0) {
+    const blocked = board.blocked[0];
+    return `📌 Tasks: blocked ${formatFlowHeadline(blocked)} · ${formatLiveTaskState(blocked)}`;
+  }
+  if (board.waiting.length > 0) {
+    const waiting = board.waiting[0];
+    return `📌 Tasks: waiting ${formatFlowHeadline(waiting)} · ${formatLiveTaskState(waiting)}`;
+  }
+  const recent = board.recent[0];
+  return recent
+    ? `📌 Tasks: ${recent.status.replaceAll("_", " ")} ${formatFlowHeadline(recent)}`
+    : undefined;
+}
+
+export function isLiveTaskDirectMessage(run: FollowupRun): boolean {
+  const provider =
+    run.originatingChannel?.trim().toLowerCase() || run.run.messageProvider?.trim().toLowerCase();
+  if (provider !== "telegram") {
+    return false;
+  }
+  const chatType = run.originatingChatType?.trim().toLowerCase();
+  return (
+    chatType !== "group" &&
+    chatType !== "supergroup" &&
+    chatType !== "channel" &&
+    Boolean(run.run.sessionKey?.trim())
+  );
+}
+
+export function createQueuedLiveTaskFlow(params: {
+  queueKey: string;
+  followupRun: FollowupRun;
+}): TaskFlowRecord {
+  const foreground = getForegroundFlowForOwner(params.queueKey);
+  const waitKind =
+    foreground && normalizeControllerStateJson(foreground.stateJson).controller.browserLease
+      ? "browser_lease"
+      : waitKindFromText(params.followupRun.prompt);
+  const flow = createManagedTaskFlow({
+    ownerKey: params.queueKey,
+    controllerId: LIVE_TASK_CONTROLLER_ID,
+    requesterOrigin: params.followupRun.run.sessionKey
+      ? {
+          channel: params.followupRun.originatingChannel,
+          accountId: params.followupRun.originatingAccountId,
+          to: params.followupRun.originatingTo,
+          threadId: params.followupRun.originatingThreadId,
+        }
+      : undefined,
+    status: "waiting",
+    goal: summarizeGoal(params.followupRun),
+    currentStep: "Waiting for the foreground flow to clear.",
+    stateJson: buildStateJson({
+      controller: {
+        foreground: false,
+        browserLease: false,
+      },
+      request: {
+        prompt: params.followupRun.prompt,
+        summaryLine: params.followupRun.summaryLine,
+        waitKind,
+      },
+    }),
+    waitJson: buildWaitJson({
+      kind: waitKind,
+      heldByFlowId: foreground?.flowId,
+      queuePosition: getFollowupQueueDepthSafe(params.queueKey) + 1,
+    }),
+  });
+  applyControllerMetadata(params.followupRun, {
+    flowId: flow.flowId,
+    waitKind,
+    skipQueuedLifecycle: true,
+    browserLease: waitKind === "browser_lease",
+  });
+  return flow;
+}
+
+function getFollowupQueueDepthSafe(queueKey: string): number {
+  return listFollowupQueueItems(queueKey).length;
+}
+
+export function beginForegroundLiveTaskFlow(params: {
+  queueKey: string;
+  followupRun: FollowupRun;
+}): TaskFlowRecord {
+  const browserLease = waitKindFromText(params.followupRun.prompt) === "browser_lease";
+  const existingFlowId = params.followupRun.controller?.flowId?.trim();
+  const existing =
+    existingFlowId &&
+    getTaskFlowByIdForOwner({ flowId: existingFlowId, callerOwnerKey: params.queueKey });
+  const flow =
+    existing && isManagedLiveTaskFlow(existing)
+      ? updateManagedFlow(existing.flowId, (current) => ({
+          status: "running",
+          currentStep: "Working in the foreground conversation.",
+          blockedTaskId: null,
+          blockedSummary: null,
+          waitJson: null,
+          endedAt: null,
+          stateJson: buildStateJson({
+            flow: current,
+            controller: {
+              foreground: true,
+              browserLease,
+            },
+            runtime: {
+              inlineActive: true,
+            },
+            request: {
+              prompt: params.followupRun.prompt,
+              summaryLine: params.followupRun.summaryLine,
+              waitKind:
+                params.followupRun.controller?.waitKind ??
+                waitKindFromText(params.followupRun.prompt),
+            },
+          }),
+        }))
+      : createManagedTaskFlow({
+          ownerKey: params.queueKey,
+          controllerId: LIVE_TASK_CONTROLLER_ID,
+          status: "running",
+          goal: summarizeGoal(params.followupRun),
+          currentStep: "Working in the foreground conversation.",
+          stateJson: buildStateJson({
+            controller: {
+              foreground: true,
+              browserLease,
+            },
+            runtime: {
+              inlineActive: true,
+            },
+            request: {
+              prompt: params.followupRun.prompt,
+              summaryLine: params.followupRun.summaryLine,
+              waitKind: waitKindFromText(params.followupRun.prompt),
+            },
+          }),
+        });
+  if (!flow) {
+    const fallback = createManagedTaskFlow({
+      ownerKey: params.queueKey,
+      controllerId: LIVE_TASK_CONTROLLER_ID,
+      status: "running",
+      goal: summarizeGoal(params.followupRun),
+      currentStep: "Working in the foreground conversation.",
+      stateJson: buildStateJson({
+        controller: {
+          foreground: true,
+          browserLease,
+        },
+        runtime: {
+          inlineActive: true,
+        },
+        request: {
+          prompt: params.followupRun.prompt,
+          summaryLine: params.followupRun.summaryLine,
+          waitKind: waitKindFromText(params.followupRun.prompt),
+        },
+      }),
+    });
+    applyControllerMetadata(params.followupRun, {
+      flowId: fallback.flowId,
+      waitKind: waitKindFromText(params.followupRun.prompt),
+      skipQueuedLifecycle: true,
+      browserLease,
+    });
+    clearManagedFlowMarkers({
+      ownerKey: params.queueKey,
+      keepFlowId: fallback.flowId,
+      clearForeground: true,
+      clearBrowserLease: true,
+      clearInlineRuntime: true,
+    });
+    return fallback;
+  }
+  applyControllerMetadata(params.followupRun, {
+    flowId: flow.flowId,
+    waitKind:
+      params.followupRun.controller?.waitKind ?? waitKindFromText(params.followupRun.prompt),
+    skipQueuedLifecycle: true,
+    browserLease,
+  });
+  clearManagedFlowMarkers({
+    ownerKey: params.queueKey,
+    keepFlowId: flow.flowId,
+    clearForeground: true,
+    clearBrowserLease: true,
+    clearInlineRuntime: true,
+  });
+  return flow;
+}
+
+export function settleLiveTaskFlow(params: {
+  flowId?: string;
+  status: "succeeded" | "failed" | "cancelled" | "lost";
+  currentStep?: string;
+  blockedSummary?: string;
+}): TaskFlowRecord | undefined {
+  const flowId = params.flowId?.trim();
+  if (!flowId) {
+    return undefined;
+  }
+  return updateManagedFlow(flowId, (flow) => ({
+    status: params.status,
+    currentStep: params.currentStep ?? flow.currentStep,
+    blockedSummary: params.blockedSummary ?? null,
+    blockedTaskId: null,
+    waitJson: null,
+    endedAt: Date.now(),
+    stateJson: buildStateJson({
+      flow,
+      controller: {
+        foreground: false,
+        browserLease: false,
+      },
+      runtime: {
+        inlineActive: false,
+      },
+    }),
+  }));
+}
+
+export function buildQueuedLiveTaskReply(params: { queueKey: string; flow: TaskFlowRecord }): {
+  text: string;
+} {
+  const foreground = getForegroundFlowForOwner(params.queueKey);
+  const reason = formatLiveTaskState(reconcileFlow(params.flow));
+  const lines = [
+    `Queued as flow ${formatLiveTaskHandle(params.flow)}.`,
+    foreground
+      ? `Foreground flow ${formatLiveTaskHandle(foreground)} is still active.`
+      : "Another foreground flow is still active.",
+    reason,
+    `Next: ${formatLiveTaskNextPhrases(params.flow).join(" · ")}`,
+  ];
+  return { text: lines.join("\n") };
+}
+
+export function buildDidNotQueueLiveTaskReply(flow: TaskFlowRecord): { text: string } {
+  return {
+    text: [
+      `Did not queue flow ${formatLiveTaskHandle(flow)} because an equivalent request is already pending.`,
+      "Next: /tasks",
+    ].join("\n"),
+  };
+}
+
+export function buildBlockingLiveTaskReply(sessionKey: string): { text: string } | undefined {
+  const board = resolveLiveTaskBoard(sessionKey);
+  if (board.all.length === 0) {
+    return undefined;
+  }
+  const lines: string[] = [];
+  if (board.foreground) {
+    lines.push(`Foreground flow ${formatLiveTaskHandle(board.foreground)} is active.`);
+    lines.push(formatLiveTaskState(board.foreground));
+  }
+  if (board.waiting.length > 0) {
+    const next = board.waiting[0];
+    lines.push(`Next waiting flow: ${formatLiveTaskHandle(next)}.`);
+    lines.push(formatLiveTaskState(next));
+    lines.push(`Next: ${formatLiveTaskNextPhrases(next).join(" · ")}`);
+  } else if (board.blocked.length > 0) {
+    const blocked = board.blocked[0];
+    lines.push(`Blocked flow: ${formatLiveTaskHandle(blocked)}.`);
+    lines.push(formatLiveTaskState(blocked));
+    lines.push(`Next: ${formatLiveTaskNextPhrases(blocked).join(" · ")}`);
+  } else if (board.foreground) {
+    lines.push(`Next: ${formatLiveTaskNextPhrases(board.foreground).join(" · ")}`);
+  }
+  return lines.length > 0 ? { text: lines.join("\n") } : undefined;
+}
+
+export function resolveLiveTaskFlow(sessionKey: string, token: string): TaskFlowRecord | undefined {
+  const flow = resolveTaskFlowForLookupTokenForOwner({
+    token,
+    callerOwnerKey: sessionKey,
+  });
+  return flow && isManagedLiveTaskFlow(flow) ? reconcileFlow(flow) : undefined;
+}
+
+function promoteForegroundFlow(params: {
+  sessionKey: string;
+  flow: TaskFlowRecord;
+}): TaskFlowRecord | undefined {
+  clearManagedFlowMarkers({
+    ownerKey: params.sessionKey,
+    keepFlowId: params.flow.flowId,
+    clearForeground: true,
+  });
+  return updateManagedFlow(params.flow.flowId, (current) => ({
+    stateJson: buildStateJson({
+      flow: current,
+      controller: {
+        foreground: true,
+      },
+    }),
+  }));
+}
+
+export function matchesBlockingQuestion(text: string): boolean {
+  return /\b(what(?:'s| is) blocking|how to clear|clear the lane|what queue|when.*clear)\b/i.test(
+    text,
+  );
+}
+
+export function matchesSteerContinue(text: string): boolean {
+  return /\bcontinue\b/i.test(text) && /\b(browser|warm|reply|replies)\b/i.test(text);
+}
+
+export function parseLiveTaskControlInput(
+  text: string,
+): { action: "continue" | "cancel" | "retry"; token: string } | undefined {
+  const match = text.trim().match(/^(continue|cancel|retry)\s+([A-Za-z0-9-]+)$/i);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    action: match[1].toLowerCase() as "continue" | "cancel" | "retry",
+    token: match[2],
+  };
+}
+
+export function steerForegroundLiveTask(params: {
+  sessionKey: string;
+  prompt: string;
+  queueEmbeddedPiMessage: (sessionId: string, text: string) => boolean;
+}): { text: string } | undefined {
+  const flow = getForegroundFlowForOwner(params.sessionKey);
+  const sessionId = resolveActiveEmbeddedRunSessionId(params.sessionKey);
+  if (!flow || !sessionId) {
+    return undefined;
+  }
+  const steered = params.queueEmbeddedPiMessage(sessionId, params.prompt);
+  if (!steered) {
+    return undefined;
+  }
+  return {
+    text: [
+      `Steered foreground flow ${formatLiveTaskHandle(flow)}.`,
+      `Next: ${formatLiveTaskNextPhrases(flow).join(" · ")}`,
+    ].join("\n"),
+  };
+}
+
+export function continueLiveTaskFlow(params: {
+  sessionKey: string;
+  flow: TaskFlowRecord;
+}): { text: string } | undefined {
+  if (
+    params.flow.status !== "running" &&
+    params.flow.status !== "queued" &&
+    params.flow.status !== "waiting"
+  ) {
+    return undefined;
+  }
+  const updated = promoteForegroundFlow(params) ?? params.flow;
+  const reconciled = reconcileFlow(updated);
+  return {
+    text: [
+      `Flow ${formatLiveTaskHandle(reconciled)} is now the foreground flow.`,
+      `State: ${formatLiveTaskState(reconciled)}`,
+      `Next: ${formatLiveTaskNextPhrases(reconciled).join(" · ")}`,
+    ].join("\n"),
+  };
+}
+
+export function cancelLiveTaskFlow(params: { sessionKey: string; flow: TaskFlowRecord }): {
+  text: string;
+} {
+  const handle = formatLiveTaskHandle(params.flow);
+  removeFollowupQueueItems(
+    params.sessionKey,
+    (item) => item.controller?.flowId === params.flow.flowId,
+  );
+  const state = normalizeControllerStateJson(params.flow.stateJson);
+  if (state.controller.foreground) {
+    replyRunRegistry.abort(params.sessionKey);
+    const sessionId = resolveActiveEmbeddedRunSessionId(params.sessionKey);
+    if (sessionId) {
+      abortEmbeddedPiRun(sessionId);
+    }
+  }
+  settleLiveTaskFlow({
+    flowId: params.flow.flowId,
+    status: "cancelled",
+  });
+  return {
+    text: `Cancelled flow ${handle}.\nNext: /tasks`,
+  };
+}
+
+export function buildFollowupRunFromFlow(params: {
+  flow: TaskFlowRecord;
+  template: FollowupRun;
+}): FollowupRun {
+  const state = normalizeControllerStateJson(params.flow.stateJson);
+  const prompt = state.request?.prompt?.trim() || params.flow.goal;
+  const run = {
+    ...params.template,
+    prompt,
+    summaryLine: state.request?.summaryLine ?? params.flow.goal,
+    enqueuedAt: Date.now(),
+  };
+  return applyControllerMetadata(run, {
+    flowId: params.flow.flowId,
+    waitKind: state.request?.waitKind ?? waitKindFromText(prompt),
+    skipQueuedLifecycle: true,
+    browserLease: state.request?.waitKind === "browser_lease",
+  });
+}
+
+export function queueLiveTaskFlowForRetry(params: {
+  sessionKey: string;
+  flow: TaskFlowRecord;
+  template: FollowupRun;
+  enqueueFollowupRun: (run: FollowupRun) => boolean;
+}): { text: string } {
+  const next = buildFollowupRunFromFlow({
+    flow: params.flow,
+    template: params.template,
+  });
+  const updated = updateManagedFlow(params.flow.flowId, (flow) => ({
+    status: "waiting",
+    currentStep: "Waiting for the foreground flow to clear.",
+    blockedTaskId: null,
+    blockedSummary: null,
+    endedAt: null,
+    waitJson: buildWaitJson({
+      kind:
+        normalizeControllerStateJson(flow.stateJson).request?.waitKind ??
+        waitKindFromText(next.prompt),
+      heldByFlowId: getForegroundFlowForOwner(params.sessionKey)?.flowId,
+      queuePosition: getFollowupQueueDepthSafe(params.sessionKey) + 1,
+    }),
+    stateJson: buildStateJson({
+      flow,
+      controller: {
+        foreground: false,
+        browserLease: false,
+      },
+      runtime: {
+        inlineActive: false,
+      },
+    }),
+  }));
+  const enqueued = params.enqueueFollowupRun(next);
+  const handle = formatLiveTaskHandle(updated ?? params.flow);
+  if (!enqueued) {
+    settleLiveTaskFlow({
+      flowId: params.flow.flowId,
+      status: "cancelled",
+      blockedSummary: "The flow was not queued because an equivalent request was already pending.",
+    });
+    return {
+      text: `Did not queue flow ${handle} because an equivalent request is already pending.\nNext: /tasks ${handle}`,
+    };
+  }
+  return {
+    text: `Queued flow ${handle} to continue.\nNext: ${formatLiveTaskNextPhrases(updated ?? params.flow).join(" · ")}`,
+  };
+}

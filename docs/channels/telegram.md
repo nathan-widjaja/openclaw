@@ -13,6 +13,9 @@ Status: production-ready for bot DMs + groups via grammY. Long polling is the de
   <Card title="Pairing" icon="link" href="/channels/pairing">
     Default DM policy for Telegram is pairing.
   </Card>
+  <Card title="Live task control" icon="list" href="/tools/live-task-control">
+    Flow-first Telegram DM control for long-running work.
+  </Card>
   <Card title="Channel troubleshooting" icon="wrench" href="/channels/troubleshooting">
     Cross-channel diagnostics and repair playbooks.
   </Card>
@@ -71,6 +74,17 @@ openclaw pairing approve telegram <CODE>
 <Note>
 Token resolution order is account-aware. In practice, config values win over env fallback, and `TELEGRAM_BOT_TOKEN` only applies to the default account.
 </Note>
+
+## First Telegram task
+
+Once pairing is done, you can run long tasks directly from the DM.
+
+1. Send a normal request such as `Reply to these mentions and keep the browser warm.`
+2. If the agent is already busy, OpenClaw replies immediately with a stable flow handle instead of a vague lane notice.
+3. Use `/tasks` to inspect the foreground flow, browser holder, blocked flows, waiting flows, and recent completions.
+4. Use `continue <flow>`, `cancel <flow>`, `retry <flow>`, or `/tasks <flow>` to control the work.
+
+See [Live Task Control](/tools/live-task-control) for the full flow model and restart/interruption contract.
 
 ## Telegram side settings
 

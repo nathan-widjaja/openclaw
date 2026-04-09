@@ -78,7 +78,7 @@ Text + native (when enabled):
 - `/tools [compact|verbose]` (show what the current agent can use right now; `verbose` adds descriptions)
 - `/skill <name> [input]` (run a skill by name)
 - `/status` (show current status; includes provider usage/quota for the current model provider when available)
-- `/tasks` (list background tasks for the current session; shows active and recent task details with agent-local fallback counts)
+- `/tasks` (list the current session task board; in Telegram DMs this is flow-first and shows foreground, browser holder, blocked, waiting, recent, and next phrases)
 - `/allowlist` (list/add/remove allowlist entries)
 - `/approve <id> <decision>` (resolve exec approval prompts; use the pending approval message for the available decisions)
 - `/context [list|detail|json]` (explain “context”; `detail` shows per-file + per-tool + per-skill + system prompt size)
@@ -140,6 +140,7 @@ Notes:
 - In multi-account channels, config-targeted `/allowlist --account <id>` and `/config set channels.<provider>.accounts.<id>...` also honor the target account's `configWrites`.
 - `/usage` controls the per-response usage footer; `/usage cost` prints a local cost summary from OpenClaw session logs.
 - `/restart` is enabled by default; set `commands.restart: false` to disable it.
+- In Telegram DMs, `/tasks <flow>` shows flow detail, and `continue <flow>`, `cancel <flow>`, and `retry <flow>` are the operator controls for managed live tasks. `/focus` and `/unfocus` remain thread-binding controls, not task controls.
 - Discord-only native command: `/vc join|leave|status` controls voice channels (requires `channels.discord.voice` and native commands; not available as text).
 - Discord thread-binding commands (`/focus`, `/unfocus`, `/agents`, `/session idle`, `/session max-age`) require effective thread bindings to be enabled (`session.threadBindings.enabled` and/or `channels.discord.threadBindings.enabled`).
 - ACP command reference and runtime behavior: [ACP Agents](/tools/acp-agents).

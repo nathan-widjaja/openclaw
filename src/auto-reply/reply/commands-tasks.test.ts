@@ -6,6 +6,10 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/task-executor.js";
+import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-registry.js";
 import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import { buildTasksReply, handleTasksCommand } from "./commands-tasks.js";
 import { buildCommandTestParams } from "./commands.test-harness.js";
@@ -27,10 +31,104 @@ async function buildTasksReplyForTest(params: { sessionKey?: string } = {}) {
 describe("buildTasksReply", () => {
   beforeEach(() => {
     resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests();
   });
 
   afterEach(() => {
     resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests();
+  });
+
+  it("shows managed flows before legacy task snapshots", async () => {
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Keep replying while the browser is warm",
+      status: "running",
+      currentStep: "Working in the foreground conversation.",
+      stateJson: {
+        controller: {
+          foreground: true,
+          browserLease: true,
+        },
+        request: {
+          prompt: "reply now",
+          summaryLine: "reply now",
+          waitKind: "browser_lease",
+        },
+      },
+    });
+    createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Review the blocking reply",
+      status: "waiting",
+      currentStep: "Waiting for the foreground flow to clear.",
+      stateJson: {
+        controller: {
+          foreground: false,
+          browserLease: false,
+        },
+        request: {
+          prompt: "review the blocking reply",
+          summaryLine: "review the blocking reply",
+          waitKind: "browser_lease",
+        },
+      },
+      waitJson: {
+        kind: "browser_lease",
+        heldByFlowId: "held-by-flow",
+        heldByHandle: "heldby12",
+        queuePosition: 1,
+      },
+    });
+
+    const reply = await buildTasksReplyForTest();
+
+    expect(reply.text).toContain("📋 Tasks");
+    expect(reply.text).toContain("Foreground:");
+    expect(reply.text).toContain("Browser holder:");
+    expect(reply.text).toContain("Waiting:");
+    expect(reply.text).toContain("continue");
+    expect(reply.text).toContain("/tasks");
+    expect(reply.text).not.toContain("Current session: 0 active");
+  });
+
+  it("shows a single flow detail when a lookup handle is provided", async () => {
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Investigate the blocked queue",
+      status: "blocked",
+      blockedSummary: "Waiting for user direction.",
+      stateJson: {
+        controller: {
+          foreground: false,
+          browserLease: false,
+        },
+        request: {
+          prompt: "investigate the blocked queue",
+          summaryLine: "investigate the blocked queue",
+          waitKind: "capacity",
+        },
+      },
+    });
+
+    const commandParams = buildCommandTestParams("/tasks", baseCfg);
+    const reply = await buildTasksReply(
+      {
+        ...commandParams,
+        sessionKey: "agent:main:main",
+      },
+      {
+        lookup: flow.flowId.slice(0, 8),
+      },
+    );
+
+    expect(reply.text).toContain("📋 Flow");
+    expect(reply.text).toContain("Investigate the blocked queue");
+    expect(reply.text).toContain("Waiting for user direction.");
+    expect(reply.text).toContain("continue");
   });
 
   it("lists active and recent tasks for the current session", async () => {
@@ -229,14 +327,35 @@ describe("buildTasksReply", () => {
 });
 
 describe("handleTasksCommand", () => {
-  it("returns usage for unsupported args", async () => {
-    const params = buildCommandTestParams("/tasks extra", baseCfg);
+  beforeEach(() => {
+    resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests();
+  });
+
+  afterEach(() => {
+    resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests();
+  });
+
+  it("treats /tasks <flow> as a flow lookup", async () => {
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "auto-reply/live-task-control",
+      goal: "Inspect the waiting board",
+      status: "waiting",
+      currentStep: "Waiting for the foreground flow to clear.",
+      stateJson: {
+        controller: {
+          foreground: false,
+          browserLease: false,
+        },
+      },
+    });
+    const params = buildCommandTestParams(`/tasks ${flow.flowId.slice(0, 8)}`, baseCfg);
 
     const result = await handleTasksCommand(params, true);
 
-    expect(result).toEqual({
-      shouldContinue: false,
-      reply: { text: "Usage: /tasks" },
-    });
+    expect(result?.reply?.text).toContain("📋 Flow");
+    expect(result?.reply?.text).toContain("Inspect the waiting board");
   });
 });

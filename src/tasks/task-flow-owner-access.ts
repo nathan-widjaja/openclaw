@@ -47,8 +47,11 @@ export function resolveTaskFlowForLookupTokenForOwner(params: {
   }
   const normalizedToken = normalizeOwnerKey(params.token);
   const normalizedCallerOwnerKey = normalizeOwnerKey(params.callerOwnerKey);
-  if (!normalizedToken || normalizedToken !== normalizedCallerOwnerKey) {
-    return undefined;
+  if (!normalizedToken || normalizedToken === normalizedCallerOwnerKey) {
+    return findLatestTaskFlowForOwner({ callerOwnerKey: params.callerOwnerKey });
   }
-  return findLatestTaskFlowForOwner({ callerOwnerKey: normalizedCallerOwnerKey });
+  const prefixMatches = listTaskFlowsForOwner({
+    callerOwnerKey: params.callerOwnerKey,
+  }).filter((flow) => flow.flowId.startsWith(normalizedToken));
+  return prefixMatches.length === 1 ? prefixMatches[0] : undefined;
 }

@@ -18,6 +18,7 @@ import {
 } from "../../tasks/task-status.js";
 import type { ReplyPayload } from "../types.js";
 import type { CommandHandler, HandleCommandsParams } from "./commands-types.js";
+import { buildLiveTaskBoardText } from "./live-task-control.js";
 
 const MAX_VISIBLE_TASKS = 5;
 
@@ -103,7 +104,18 @@ function formatVisibleTask(task: TaskRecord, index: number): string {
   return lines.join("\n");
 }
 
-export function buildTasksText(params: { sessionKey: string; agentId: string }): string {
+export function buildTasksText(params: {
+  sessionKey: string;
+  agentId: string;
+  lookup?: string;
+}): string {
+  const flowBoard = buildLiveTaskBoardText({
+    sessionKey: params.sessionKey,
+    lookup: params.lookup,
+  });
+  if (flowBoard) {
+    return flowBoard;
+  }
   const sessionSnapshot = buildTaskStatusSnapshot(
     listTasksForSessionKeyForStatus(params.sessionKey),
   );
@@ -135,7 +147,10 @@ export function buildTasksText(params: { sessionKey: string; agentId: string }):
   return lines.join("\n");
 }
 
-export async function buildTasksReply(params: HandleCommandsParams): Promise<ReplyPayload> {
+export async function buildTasksReply(
+  params: HandleCommandsParams,
+  opts?: { lookup?: string },
+): Promise<ReplyPayload> {
   const agentId =
     params.agentId ??
     resolveSessionAgentId({
@@ -146,6 +161,7 @@ export async function buildTasksReply(params: HandleCommandsParams): Promise<Rep
     text: buildTasksText({
       sessionKey: params.sessionKey,
       agentId,
+      lookup: opts?.lookup,
     }),
   };
 }
@@ -164,14 +180,13 @@ export const handleTasksCommand: CommandHandler = async (params, allowTextComman
     );
     return { shouldContinue: false };
   }
-  if (normalized !== "/tasks") {
-    return {
-      shouldContinue: false,
-      reply: { text: "Usage: /tasks" },
-    };
-  }
   return {
     shouldContinue: false,
-    reply: await buildTasksReply(params),
+    reply: await buildTasksReply(
+      params,
+      normalized === "/tasks"
+        ? undefined
+        : { lookup: normalized.slice("/tasks ".length).trim() || undefined },
+    ),
   };
 };
