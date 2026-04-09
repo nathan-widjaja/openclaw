@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       docs_only: ${{ steps.manifest.outputs.docs_only }}
+      workflow_only: ${{ steps.workflow_scope.outputs.workflow_only }}
       docs_changed: ${{ steps.manifest.outputs.docs_changed }}
       run_node: ${{ steps.manifest.outputs.run_node }}
       run_macos: ${{ steps.manifest.outputs.run_macos }}
@@ -72,6 +73,32 @@ jobs:
       - name: Detect docs-only changes
         id: docs_scope
         uses: ./.github/actions/detect-docs-changes
+
+      - name: Detect workflow-only changes
+        id: workflow_scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+          else
+            BASE="${{ github.event.pull_request.base.sha }}"
+          fi
+
+          workflow_only=true
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              .github/workflows/*|.github/actions/*|.github/actionlint.yaml) ;;
+              *)
+                workflow_only=false
+                break
+                ;;
+            esac
+          done < <(git diff --name-only "$BASE" HEAD)
+
+          echo "workflow_only=$workflow_only" >> "$GITHUB_OUTPUT"
 
       - name: Detect changed scopes
         id: changed_scope
@@ -124,6 +151,7 @@ jobs:
         env:
           OPENCLAW_CI_DOCS_ONLY: ${{ steps.docs_scope.outputs.docs_only }}
           OPENCLAW_CI_DOCS_CHANGED: ${{ steps.docs_scope.outputs.docs_changed }}
+          OPENCLAW_CI_WORKFLOW_ONLY: ${{ steps.workflow_scope.outputs.workflow_only }}
           OPENCLAW_CI_RUN_NODE: ${{ steps.changed_scope.outputs.run_node || 'false' }}
           OPENCLAW_CI_RUN_MACOS: ${{ steps.changed_scope.outputs.run_macos || 'false' }}
           OPENCLAW_CI_RUN_ANDROID: ${{ steps.changed_scope.outputs.run_android || 'false' }}
@@ -162,6 +190,11 @@ jobs:
           const isPush = eventName === "push";
           const docsOnly = parseBoolean(process.env.OPENCLAW_CI_DOCS_ONLY);
           const docsChanged = parseBoolean(process.env.OPENCLAW_CI_DOCS_CHANGED);
+          const workflowOnly = parseBoolean(process.env.OPENCLAW_CI_WORKFLOW_ONLY);
+          const forkWorkflowOnlyPullRequest =
+            process.env.GITHUB_REPOSITORY === "nathan-widjaja/openclaw" &&
+            eventName === "pull_request" &&
+            workflowOnly;
           const runNode = parseBoolean(process.env.OPENCLAW_CI_RUN_NODE) && !docsOnly;
           const runMacos = parseBoolean(process.env.OPENCLAW_CI_RUN_MACOS) && !docsOnly;
           const runAndroid = parseBoolean(process.env.OPENCLAW_CI_RUN_ANDROID) && !docsOnly;
@@ -190,17 +223,19 @@ jobs:
           const manifest = {
             docs_only: docsOnly,
             docs_changed: docsChanged,
-            run_node: runNode,
-            run_macos: runMacos,
-            run_android: runAndroid,
-            run_skills_python: runSkillsPython,
-            run_windows: runWindows,
+            run_node: forkWorkflowOnlyPullRequest ? false : runNode,
+            run_macos: forkWorkflowOnlyPullRequest ? false : runMacos,
+            run_android: forkWorkflowOnlyPullRequest ? false : runAndroid,
+            run_skills_python: forkWorkflowOnlyPullRequest ? false : runSkillsPython,
+            run_windows: forkWorkflowOnlyPullRequest ? false : runWindows,
             has_changed_extensions: hasChangedExtensions,
             changed_extensions_matrix: changedExtensionsMatrix,
-            run_build_artifacts: runNode,
-            run_checks_fast: runNode,
+            run_build_artifacts: forkWorkflowOnlyPullRequest ? false : runNode,
+            run_checks_fast: forkWorkflowOnlyPullRequest ? false : runNode,
             checks_fast_core_matrix: createMatrix(
-              runNode
+              forkWorkflowOnlyPullRequest
+                ? []
+                : runNode
                 ? [
                     { check_name: "checks-fast-bundled", runtime: "node", task: "bundled" },
                     {
@@ -211,10 +246,14 @@ jobs:
                   ]
                 : [],
             ),
-            checks_fast_extensions_matrix: extensionShardMatrix,
-            run_checks: runNode,
+            checks_fast_extensions_matrix: forkWorkflowOnlyPullRequest
+              ? createMatrix([])
+              : extensionShardMatrix,
+            run_checks: forkWorkflowOnlyPullRequest ? false : runNode,
             checks_matrix: createMatrix(
-              runNode
+              forkWorkflowOnlyPullRequest
+                ? []
+                : runNode
                 ? [
                     { check_name: "checks-node-test", runtime: "node", task: "test" },
                     { check_name: "checks-node-channels", runtime: "node", task: "channels" },
@@ -232,35 +271,45 @@ jobs:
                   ]
                 : [],
             ),
-            run_extension_fast: hasChangedExtensions,
+            run_extension_fast: forkWorkflowOnlyPullRequest ? false : hasChangedExtensions,
             extension_fast_matrix: createMatrix(
-              hasChangedExtensions
+              forkWorkflowOnlyPullRequest
+                ? []
+                : hasChangedExtensions
                 ? (changedExtensionsMatrix.include ?? []).map((entry) => ({
                     check_name: `extension-fast-${entry.extension}`,
                     extension: entry.extension,
                   }))
                 : [],
             ),
-            run_check: runNode,
-            run_check_additional: runNode,
-            run_build_smoke: runNode,
+            run_check: forkWorkflowOnlyPullRequest ? false : runNode,
+            run_check_additional: forkWorkflowOnlyPullRequest ? false : runNode,
+            run_build_smoke: forkWorkflowOnlyPullRequest ? false : runNode,
             run_check_docs: docsChanged,
             run_control_ui_i18n: runControlUiI18n,
-            run_skills_python_job: runSkillsPython,
-            run_checks_windows: runWindows,
+            run_skills_python_job: forkWorkflowOnlyPullRequest ? false : runSkillsPython,
+            run_checks_windows: forkWorkflowOnlyPullRequest ? false : runWindows,
             checks_windows_matrix: createMatrix(
-              runWindows
+              forkWorkflowOnlyPullRequest
+                ? []
+                : runWindows
                 ? [{ check_name: "checks-windows-node-test", runtime: "node", task: "test" }]
                 : [],
             ),
-            run_macos_node: runMacos,
+            run_macos_node: forkWorkflowOnlyPullRequest ? false : runMacos,
             macos_node_matrix: createMatrix(
-              runMacos ? [{ check_name: "macos-node", runtime: "node", task: "test" }] : [],
+              forkWorkflowOnlyPullRequest
+                ? []
+                : runMacos
+                  ? [{ check_name: "macos-node", runtime: "node", task: "test" }]
+                  : [],
             ),
-            run_macos_swift: runMacos,
-            run_android_job: runAndroid,
+            run_macos_swift: forkWorkflowOnlyPullRequest ? false : runMacos,
+            run_android_job: forkWorkflowOnlyPullRequest ? false : runAndroid,
             android_matrix: createMatrix(
-              runAndroid
+              forkWorkflowOnlyPullRequest
+                ? []
+                : runAndroid
                 ? [
                     { check_name: "android-test-play", task: "test-play" },
                     { check_name: "android-test-third-party", task: "test-third-party" },
@@ -312,6 +361,32 @@ jobs:
           trusted_config="$RUNNER_TEMP/pre-commit-base.yaml"
           git show "${BASE_SHA}:.pre-commit-config.yaml" > "$trusted_config"
           echo "PRE_COMMIT_CONFIG_PATH=$trusted_config" >> "$GITHUB_ENV"
+
+      - name: Detect workflow-only changes
+        id: workflow_scope
+        env:
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE_SHA:-}" ] || [ "${BASE_SHA}" = "0000000000000000000000000000000000000000" ]; then
+            echo "workflow_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          workflow_only=true
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              .github/workflows/*|.github/actions/*|.github/actionlint.yaml) ;;
+              *)
+                workflow_only=false
+                break
+                ;;
+            esac
+          done < <(git diff --name-only "${BASE_SHA}" HEAD)
+
+          echo "workflow_only=$workflow_only" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
@@ -375,6 +450,7 @@ jobs:
           pre-commit run --config "${PRE_COMMIT_CONFIG_PATH:-.pre-commit-config.yaml}" zizmor --files "${workflow_files[@]}"
 
       - name: Audit production dependencies
+        if: github.repository != 'nathan-widjaja/openclaw' || github.event_name != 'pull_request' || steps.workflow_scope.outputs.workflow_only != 'true'
         run: pre-commit run --config "${PRE_COMMIT_CONFIG_PATH:-.pre-commit-config.yaml}" --all-files pnpm-audit-prod
 
   # Build dist once for Node-relevant changes and share it with downstream jobs.
