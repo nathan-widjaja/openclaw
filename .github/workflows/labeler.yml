@@ -27,6 +27,7 @@ permissions: {}
 
 jobs:
   label:
+    if: github.event_name == 'pull_request_target' && github.repository != 'nathan-widjaja/openclaw'
     permissions:
       contents: read
       pull-requests: write
@@ -735,6 +736,7 @@ jobs:
             core.info(`Processed ${processed} pull requests.`);
 
   label-issues:
+    if: github.event_name == 'issues'
     permissions:
       issues: write
     runs-on: ${{ vars.OPENCLAW_CI_LINUX_RUNNER || (github.repository == 'nathan-widjaja/openclaw' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404') }}
